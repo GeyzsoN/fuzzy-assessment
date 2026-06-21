@@ -19,8 +19,10 @@ core is solid. **A correct, well-structured core beats a broad, shaky one.**
   - `page` / `limit`
   - `search` — matches against `name` and `company`
   - `sort` — at least by `name` and `createdAt`
-  - ⚠️ Pagination must be **stable**: the same contact must never appear on two pages, and
-    none must be skipped, as records are added. Think about your sort.
+  - ⚠️ Pagination must be **deterministic**: for a fixed dataset, the same contact must never
+    appear on two pages and none must be skipped. This breaks easily if you sort on a
+    non-unique field (e.g. lots of contacts created in the same millisecond, or paging by
+    `name`) — think about what makes the ordering total. Note in PLAN.md how you guarantee it.
 - A Mongoose **schema** with appropriate types and at least one **index** you can justify.
 - At least one co-located **`.spec.ts`** unit test for the service (e.g. the list/pagination logic).
 
@@ -30,6 +32,9 @@ core is solid. **A correct, well-structured core beats a broad, shaky one.**
   - The template uses `{{placeholders}}`, e.g.
     `"Write a 2-sentence LinkedIn opener for {{name}}, a {{title}} at {{company}}."`
 - **`POST /campaigns/:id/contacts`** — attach one or more existing contacts to a campaign.
+- **`GET /campaigns/:id`** — return the campaign and its attached contacts. Include enough
+  contact detail (at least name) for the frontend to render the list and each contact's
+  generation status/message — how you shape that (populate vs. a second fetch) is your call.
 - **`POST /campaigns/:id/contacts/:contactId/generate`** — the centerpiece:
   1. Interpolate the contact's data into the campaign's `promptTemplate`.
   2. Call the LLM (use the provided `LlmService`).

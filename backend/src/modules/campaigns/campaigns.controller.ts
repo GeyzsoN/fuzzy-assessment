@@ -37,7 +37,4 @@ export class CampaignsController {
   ) {
     return this.campaignsService.generateForContact(userId, id, contactId);
   }
-
-  // NOTE(interviewer): the live extension asks the candidate to add
-  // POST :id/generate-all here. Left intentionally unimplemented.
 }

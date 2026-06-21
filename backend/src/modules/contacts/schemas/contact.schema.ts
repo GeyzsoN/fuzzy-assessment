@@ -33,5 +33,5 @@ export class Contact {
 export type ContactDocument = Contact & Document;
 export const ContactSchema = SchemaFactory.createForClass(Contact);
 
-// TODO(candidate): add compound index(es) here, e.g. for stable, user-scoped,
-// sorted+searchable listing. Justify your choice in PLAN.md.
+// TODO(candidate): add any index(es) that fit how the list endpoint queries
+// this collection. Justify your choice in PLAN.md.

@@ -1,6 +1,7 @@
 # Setup
 
-Prerequisites: **Node 20+**, **Docker** (for MongoDB), and an **Anthropic API key**.
+Prerequisites: **Node 20+**, **Docker** (for MongoDB), and an **LLM API key** for one of
+Anthropic, OpenAI, or Google Gemini (your choice — see step 2).
 
 ## 1. MongoDB
 
@@ -22,7 +23,9 @@ npm run start:dev
 - API base: http://localhost:8080
 - Health check: http://localhost:8080/health
 
-Every request must include a header identifying the current user (the lightweight auth stand-in):
+Every request to the **contacts and campaigns** endpoints must include a header identifying the
+current user (the lightweight auth stand-in). `/health` and `/llm/smoke` are open so you can
+verify setup without it.
 
 ```
 x-user-id: demo-user

@@ -31,11 +31,14 @@ export class LlmService {
   }
 
   private defaultModel(): string {
+    // Cheap/fast defaults per provider. If your account doesn't have one of
+    // these, set LLM_MODEL in .env to a model you can access — the code doesn't
+    // care which model string you use.
     switch (this.provider) {
       case 'openai':
         return 'gpt-4o-mini';
       case 'gemini':
-        return 'gemini-1.5-flash';
+        return 'gemini-2.0-flash';
       case 'anthropic':
       default:
         return 'claude-haiku-4-5';

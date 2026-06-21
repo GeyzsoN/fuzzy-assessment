@@ -7,8 +7,7 @@
     "start": "nest start",
     "start:dev": "nest start --watch",
     "test": "jest",
-    "test:watch": "jest --watch",
-    "lint": "eslint \"src/**/*.ts\""
+    "test:watch": "jest --watch"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",

@@ -21,8 +21,8 @@ typed every character.
 You do **not** start from a blank page. This repo gives you:
 
 - A running **NestJS 10** backend (`/backend`) with Mongo connection, an empty `contacts`
-  and `campaigns` module stub, a lightweight auth guard, and the **Anthropic SDK pre-installed
-  and wired** behind an `LlmService`.
+  and `campaigns` module stub, a lightweight auth guard, and a **provider-agnostic LLM client
+  (Anthropic / OpenAI / Gemini) pre-installed and wired** behind an `LlmService`.
 - A running **Next.js 15** frontend (`/frontend`) with a service layer + an example hook
   pattern to follow.
 - Seed-free local Mongo via Docker.

@@ -21,10 +21,17 @@ export class ContactsService {
     userId: string,
     query: ListContactsDto,
   ): Promise<{ items: Contact[]; total: number; page: number; limit: number }> {
-    // TODO(candidate): return a STABLE paginated, searchable, sorted list scoped
-    // to userId. The same contact must never appear on two pages as records are
-    // added; none must be skipped. This is the most important backend detail —
-    // get the sort right.
+    // TODO(candidate): return a paginated, searchable, sorted list scoped to
+    // userId. Make the ordering deterministic so paging is consistent.
+    throw new Error('Not implemented');
+  }
+
+  /**
+   * Look up specific contacts owned by a user. The campaigns module needs this
+   * to attach/generate against contacts without reaching into the model itself.
+   * TODO(candidate): implement (return only contacts whose userId matches).
+   */
+  async findOwnedByIds(userId: string, contactIds: string[]): Promise<Contact[]> {
     throw new Error('Not implemented');
   }
 }

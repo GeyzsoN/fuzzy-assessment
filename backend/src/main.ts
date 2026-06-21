@@ -15,7 +15,12 @@ async function bootstrap() {
     }),
   );
 
-  app.enableCors({ origin: 'http://localhost:3000', credentials: true });
+  // Allow the Next dev server. Defaults to :3000 but is configurable in case
+  // Next picks another port (e.g. 3001 when 3000 is taken).
+  app.enableCors({
+    origin: process.env.FRONTEND_ORIGIN || 'http://localhost:3000',
+    credentials: true,
+  });
 
   const port = process.env.PORT || 8080;
   await app.listen(port);
