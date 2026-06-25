@@ -19,6 +19,7 @@ import { useContacts } from '@/hooks/useContacts';
 const DEFAULT_LIMIT = 10;
 const ALLOWED_LIMITS = [10, 20, 50];
 type ContactSort = 'name' | 'email' | 'company' | 'createdAt';
+type ContactSortDirection = 'asc' | 'desc';
 
 function readPositiveInt(value: string | null, fallback: number) {
   const parsed = Number(value);
@@ -36,21 +37,34 @@ function readContactsSort(value: string | null): ContactSort {
     : 'name';
 }
 
+function defaultSortDirection(sort: ContactSort): ContactSortDirection {
+  return sort === 'createdAt' ? 'desc' : 'asc';
+}
+
+function readSortDirection(
+  value: string | null,
+  sort: ContactSort,
+): ContactSortDirection {
+  return value === 'asc' || value === 'desc' ? value : defaultSortDirection(sort);
+}
+
 function ContactsSortIcon({
   activeSort,
+  activeDirection,
   sortKey,
 }: {
   activeSort: ContactSort;
+  activeDirection: ContactSortDirection;
   sortKey: ContactSort;
 }) {
   if (activeSort !== sortKey) {
     return <ArrowUpDown className="h-3.5 w-3.5 text-slate-300" aria-hidden="true" />;
   }
 
-  return sortKey === 'createdAt' ? (
-    <ArrowDown className="h-3.5 w-3.5 text-slate-600" aria-hidden="true" />
-  ) : (
+  return activeDirection === 'asc' ? (
     <ArrowUp className="h-3.5 w-3.5 text-slate-600" aria-hidden="true" />
+  ) : (
+    <ArrowDown className="h-3.5 w-3.5 text-slate-600" aria-hidden="true" />
   );
 }
 
@@ -70,6 +84,7 @@ function ContactsPageContent() {
   const urlLimit = readLimit(searchParams.get('limit'));
   const activeSearch = searchParams.get('search') || '';
   const activeSort = readContactsSort(searchParams.get('sort'));
+  const activeDirection = readSortDirection(searchParams.get('direction'), activeSort);
 
   const [createSuccess, setCreateSuccess] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -97,6 +112,7 @@ function ContactsPageContent() {
     limit: urlLimit,
     search: activeSearch,
     sort: activeSort,
+    direction: activeDirection,
   });
 
   const contacts = (data?.items || []).map((contact) => ({
@@ -113,16 +129,24 @@ function ContactsPageContent() {
   const pageCount = Math.max(1, Math.ceil(totalCount / (data?.limit || urlLimit)));
 
   const updateListUrl = useCallback(
-    (next: { page?: number; limit?: number; search?: string; sort?: ContactSort }) => {
+    (next: {
+      page?: number;
+      limit?: number;
+      search?: string;
+      sort?: ContactSort;
+      direction?: ContactSortDirection;
+    }) => {
       const params = new URLSearchParams(searchParams.toString());
       const nextPage = next.page ?? urlPage;
       const nextLimit = next.limit ?? urlLimit;
       const nextSearch = next.search ?? activeSearch;
       const nextSort = next.sort ?? activeSort;
+      const nextDirection = next.direction ?? activeDirection;
 
       params.set('page', String(Math.max(1, nextPage)));
       params.set('limit', String(nextLimit));
       params.set('sort', nextSort);
+      params.set('direction', nextDirection);
       if (nextSearch.trim()) {
         params.set('search', nextSearch.trim());
       } else {
@@ -131,7 +155,7 @@ function ContactsPageContent() {
 
       router.push(`/contacts?${params.toString()}`, { scroll: false });
     },
-    [activeSearch, activeSort, router, searchParams, urlLimit, urlPage],
+    [activeDirection, activeSearch, activeSort, router, searchParams, urlLimit, urlPage],
   );
 
   useEffect(() => {
@@ -150,11 +174,15 @@ function ContactsPageContent() {
       params.set('sort', activeSort);
       changed = true;
     }
+    if (params.get('direction') !== activeDirection) {
+      params.set('direction', activeDirection);
+      changed = true;
+    }
 
     if (changed) {
       router.replace(`/contacts?${params.toString()}`, { scroll: false });
     }
-  }, [activeSort, queryString, router, urlLimit, urlPage]);
+  }, [activeDirection, activeSort, queryString, router, urlLimit, urlPage]);
 
   useEffect(() => {
     setSearchQuery(activeSearch);
@@ -166,8 +194,9 @@ function ContactsPageContent() {
       limit: urlLimit,
       search: activeSearch,
       sort: activeSort,
+      direction: activeDirection,
     });
-  }, [activeSearch, activeSort, setParams, urlLimit, urlPage]);
+  }, [activeDirection, activeSearch, activeSort, setParams, urlLimit, urlPage]);
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -179,7 +208,16 @@ function ContactsPageContent() {
   };
 
   const handleSortChange = (sort: ContactSort) => {
-    updateListUrl({ page: 1, sort });
+    updateListUrl({
+      page: 1,
+      sort,
+      direction:
+        activeSort === sort
+          ? activeDirection === 'asc'
+            ? 'desc'
+            : 'asc'
+          : defaultSortDirection(sort),
+    });
   };
 
   const handleCreateContact = async (e: React.FormEvent) => {
@@ -419,7 +457,7 @@ function ContactsPageContent() {
                           onClick={() => handleSortChange('name')}
                           className="inline-flex items-center gap-1 hover:text-slate-700"
                         >
-                          Name / Title <ContactsSortIcon activeSort={activeSort} sortKey="name" />
+                          Name / Title <ContactsSortIcon activeSort={activeSort} activeDirection={activeDirection} sortKey="name" />
                         </button>
                       </th>
                       <th className="w-[32%] px-6 py-4">
@@ -428,7 +466,7 @@ function ContactsPageContent() {
                           onClick={() => handleSortChange('email')}
                           className="inline-flex items-center gap-1 hover:text-slate-700"
                         >
-                          Email <ContactsSortIcon activeSort={activeSort} sortKey="email" />
+                          Email <ContactsSortIcon activeSort={activeSort} activeDirection={activeDirection} sortKey="email" />
                         </button>
                       </th>
                       <th className="w-[26%] px-6 py-4">
@@ -437,7 +475,7 @@ function ContactsPageContent() {
                           onClick={() => handleSortChange('company')}
                           className="inline-flex items-center gap-1 hover:text-slate-700"
                         >
-                          Company <ContactsSortIcon activeSort={activeSort} sortKey="company" />
+                          Company <ContactsSortIcon activeSort={activeSort} activeDirection={activeDirection} sortKey="company" />
                         </button>
                       </th>
                       <th className="w-[11%] px-6 py-4 text-center">Status</th>
@@ -447,7 +485,7 @@ function ContactsPageContent() {
                           onClick={() => handleSortChange('createdAt')}
                           className="ml-auto inline-flex items-center gap-1 hover:text-slate-700"
                         >
-                          Created <ContactsSortIcon activeSort={activeSort} sortKey="createdAt" />
+                          Created <ContactsSortIcon activeSort={activeSort} activeDirection={activeDirection} sortKey="createdAt" />
                         </button>
                       </th>
                     </tr>

@@ -23,4 +23,8 @@ export class ListContactsDto {
   @IsOptional()
   @IsIn(['name', 'email', 'company', 'createdAt'])
   sort?: 'name' | 'email' | 'company' | 'createdAt' = 'createdAt';
+
+  @IsOptional()
+  @IsIn(['asc', 'desc'])
+  direction?: 'asc' | 'desc';
 }
