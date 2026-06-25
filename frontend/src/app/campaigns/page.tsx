@@ -42,6 +42,7 @@ const OUTREACH_TEMPLATES = {
     description: 'Pitch your core product value, automate follow-ups, and book client demos.',
     subject: 'Optimizing your workflow efficiency',
     tone: 'Warm',
+    generationPrompt: 'Generate a concise multi-step sales outreach sequence that introduces our product value, follows up with a practical workflow benefit, and closes politely if there is no interest. Each step should be an actual email body with placeholders like {{first_name}}, {{title}}, and {{company}}.',
     prompt: 'Hi {{first_name}},\n\nI noticed your work as {{title}} at {{company}} and thought there may be a practical way to automate repeatable operational sequences for your team.\n\nWorth a quick look?',
     coverImage: 'https://images.unsplash.com/photo-1460925895917-afdab827c52f?auto=format&fit=crop&w=600&h=400&q=80',
   },
@@ -51,6 +52,7 @@ const OUTREACH_TEMPLATES = {
     description: 'Reach high-performing candidates and pitch open roles at your organization.',
     subject: 'Exploring career opportunities together',
     tone: 'Professional',
+    generationPrompt: 'Generate a concise multi-step recruiting outreach sequence that introduces a relevant role, follows up with why the opportunity may fit the recipient, and closes politely. Each step should be an actual email body with placeholders like {{first_name}}, {{title}}, and {{company}}.',
     prompt: 'Hi {{first_name}},\n\nYour work as {{title}} stood out. I am reaching out because there may be a role that matches the kind of impact you have had at {{company}}.\n\nOpen to a brief conversation?',
     coverImage: 'https://images.unsplash.com/photo-1556761175-b413da4baf72?auto=format&fit=crop&w=600&h=400&q=80',
   },
@@ -60,6 +62,7 @@ const OUTREACH_TEMPLATES = {
     description: 'Reach out to executive leaders to propose business integrations or deals.',
     subject: 'Exploring strategic integration with ${contactCompany}',
     tone: 'Direct',
+    generationPrompt: 'Generate a concise multi-step partnership outreach sequence that opens with a practical collaboration angle, follows up with a specific integration or partnership reason, and closes politely. Each step should be an actual email body with placeholders like {{first_name}}, {{title}}, and {{company}}.',
     prompt: 'Hi {{first_name}},\n\nI think there may be a practical integration angle between our workflows and what {{company}} is building. If relevant, I would be glad to compare notes for 15 minutes next week.\n\nWorth exploring?',
     coverImage: 'https://images.unsplash.com/photo-1522071820081-009f0129c71c?auto=format&fit=crop&w=600&h=400&q=80',
   },
@@ -379,7 +382,7 @@ function CampaignsPageContent() {
     const generatedName = `${defaults.name} - ${new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`;
     setWizardName(generatedName);
     setWizardTone(defaults.tone);
-    setWizardSinglePrompt(defaults.prompt);
+    setWizardSinglePrompt(defaults.generationPrompt);
     
     // Adjust wizard steps using defaults
     const updatedSteps = Array.from({ length: wizardStepsCount }).map((_, idx) => {
@@ -409,7 +412,7 @@ function CampaignsPageContent() {
     const generatedName = `${defaults.name} - ${new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`;
     setWizardName(generatedName);
     setWizardTone(defaults.tone);
-    setWizardSinglePrompt(defaults.prompt);
+    setWizardSinglePrompt(defaults.generationPrompt);
     setWizardMode('auto');
     setWizardDelayAmount(3);
     setWizardDelayUnit('days');
@@ -1740,18 +1743,18 @@ function CampaignsPageContent() {
                         <div className="space-y-1.5">
                           <div className="flex justify-between items-center">
                             <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-                              Master Campaign Strategy / Single Prompt
+                              AI Sequence Generation Prompt
                             </label>
                             <span className="text-[9px] text-slate-400 font-medium">
-                              This instruction guides the synthesis of all sequence follow-ups.
+                              One prompt generates all selected follow-up steps.
                             </span>
                           </div>
                           <textarea
                             required
                             value={wizardSinglePrompt}
                             onChange={(e) => setWizardSinglePrompt(e.target.value)}
-                            placeholder="Describe your outreach campaign. E.g., Pitch our SaaS analytics software value prop. First follow up after 3 days should point out a relevant case study. Third follow up should politely request a brief 10-minute sync."
-                            rows={5}
+                            placeholder="Tell the AI what sequence to create. Example: Generate a 3-step outreach sequence for revenue leaders. Step 1 introduces the operational benefit, step 2 follows up with a concrete example, step 3 closes politely. Use placeholders like {{first_name}}, {{title}}, and {{company}}."
+                            rows={6}
                             className="w-full px-3.5 py-3 border border-slate-200 bg-white rounded-xl text-xs leading-relaxed text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all resize-none"
                           />
                         </div>
@@ -1764,7 +1767,7 @@ function CampaignsPageContent() {
                               Sequence Length (Drip Steps Count)
                             </label>
                             <div className="flex gap-2">
-                              {[1, 2, 3].map((num) => (
+                              {[1, 2, 3, 4].map((num) => (
                                 <button
                                   key={num}
                                   type="button"
@@ -1944,8 +1947,8 @@ function CampaignsPageContent() {
                         {wizardMode === 'auto' ? (
                           <>
                             <div className="col-span-2">
-                              <span className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">Master Campaign Direction</span>
-                              <p className="font-medium text-slate-600 line-clamp-3 bg-slate-50 p-2 rounded border border-slate-100 mt-1 italic">{wizardSinglePrompt}</p>
+                              <span className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">AI Sequence Generation Prompt</span>
+                              <p className="whitespace-pre-wrap break-words font-medium text-slate-600 bg-slate-50 p-3 rounded border border-slate-100 mt-1">{wizardSinglePrompt}</p>
                             </div>
                             <div>
                               <span className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">Drip Steps Length</span>
@@ -2022,6 +2025,10 @@ function CampaignsPageContent() {
                       }
                       if (wizardStep === 3 && !wizardName.trim()) {
                         setWizardError('Campaign sequence name is required.');
+                        return;
+                      }
+                      if (wizardStep === 4 && wizardMode === 'auto' && !wizardSinglePrompt.trim()) {
+                        setWizardError('AI sequence generation prompt is required.');
                         return;
                       }
                       const nextStep = Math.min(wizardStep + 1, 5);
