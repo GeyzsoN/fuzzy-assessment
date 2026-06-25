@@ -70,18 +70,20 @@ const OUTREACH_TEMPLATES = {
 
 const CORE_PROMPT_TEMPLATES = [
   {
-    label: 'LinkedIn opener',
-    value: 'Write a concise 2-sentence LinkedIn opener for {{name}}, a {{title}} at {{company}}.',
+    label: '2-step opener',
+    value: 'Create a 2-step LinkedIn outreach sequence for {{name}}, a {{title}} at {{company}}. Step 1 should be a concise opener. Step 2 should be a polite follow-up. Keep each email body under 60 words.',
   },
   {
-    label: 'Warm intro',
-    value: 'Write a warm 2-sentence outreach opener for {{name}}, a {{title}} at {{company}}. Mention their role and ask if improving team workflows is relevant.',
+    label: '3-step warm intro',
+    value: 'Create a 3-step warm outreach sequence for {{name}}, a {{title}} at {{company}}. Step 1 should mention their role, step 2 should expand on a practical workflow benefit, and step 3 should close politely. Keep each email body under 70 words.',
   },
   {
-    label: 'Direct sales',
-    value: 'Write a direct 2-sentence sales opener for {{name}} at {{company}}. Connect their {{title}} role to a practical operational pain point and end with a low-pressure question.',
+    label: '4-step direct sales',
+    value: 'Create a 4-step direct sales outreach sequence for {{name}}, a {{title}} at {{company}}. Step 1 should identify a practical pain point, step 2 should explain the business value, step 3 should offer a concrete example, and step 4 should close the loop politely. Keep each email body under 70 words.',
   },
 ];
+
+const DEFAULT_CORE_PROMPT_TEMPLATE = CORE_PROMPT_TEMPLATES[0].value;
 
 function getDelayFields(minutes: number): { amount: number; unit: 'minutes' | 'hours' | 'days' } {
   if (minutes % 1440 === 0 && minutes >= 1440) {
@@ -177,7 +179,7 @@ function CampaignsPageContent() {
   // Primary campaign creation form.
   const [coreName, setCoreName] = useState('');
   const [corePromptTemplate, setCorePromptTemplate] = useState(
-    'Write a concise 2-sentence LinkedIn opener for {{name}}, a {{title}} at {{company}}.',
+    DEFAULT_CORE_PROMPT_TEMPLATE,
   );
   const [coreGroupIds, setCoreGroupIds] = useState<string[]>([]);
   const [coreContactIds, setCoreContactIds] = useState<string[]>([]);
@@ -698,9 +700,7 @@ function CampaignsPageContent() {
       }
 
       setCoreName('');
-      setCorePromptTemplate(
-        'Write a concise 2-sentence LinkedIn opener for {{name}}, a {{title}} at {{company}}.',
-      );
+      setCorePromptTemplate(DEFAULT_CORE_PROMPT_TEMPLATE);
       setCoreGroupIds([]);
       setCoreContactIds([]);
       router.push(`/campaigns/${campaign.id}`);
