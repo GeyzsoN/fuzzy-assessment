@@ -6,6 +6,7 @@ import { Contact } from './schemas/contact.schema';
 describe('ContactsService', () => {
   let service: ContactsService;
   let model: {
+    create: jest.Mock;
     find: jest.Mock;
     countDocuments: jest.Mock;
   };
@@ -26,6 +27,7 @@ describe('ContactsService', () => {
       exec: jest.fn().mockResolvedValue([{ name: 'Ada Lovelace' }]),
     };
     model = {
+      create: jest.fn(),
       find: jest.fn().mockReturnValue(findChain),
       countDocuments: jest
         .fn()
@@ -82,5 +84,16 @@ describe('ContactsService', () => {
       ],
     });
     expect(findChain.sort).toHaveBeenCalledWith({ name: 1, _id: 1 });
+  });
+
+  it('turns duplicate contact emails into a 400 instead of an unhandled 500', async () => {
+    model.create.mockRejectedValue({ code: 11000 });
+
+    await expect(
+      service.create('user-1', {
+        name: 'Ada Lovelace',
+        email: 'ada@example.com',
+      }),
+    ).rejects.toThrow('A contact with this email already exists.');
   });
 });

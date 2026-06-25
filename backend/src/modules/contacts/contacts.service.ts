@@ -13,7 +13,16 @@ export class ContactsService {
   ) {}
 
   async create(userId: string, dto: CreateContactDto): Promise<Contact> {
-    return this.contactModel.create({ ...dto, userId });
+    try {
+      return await this.contactModel.create({ ...dto, userId });
+    } catch (error) {
+      if (isDuplicateKeyError(error)) {
+        throw new BadRequestException(
+          'A contact with this email already exists.',
+        );
+      }
+      throw error;
+    }
   }
 
   async list(
@@ -82,4 +91,13 @@ export class ContactsService {
 
 function escapeRegex(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function isDuplicateKeyError(error: unknown): error is { code: number } {
+  return Boolean(
+    error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      (error as { code?: number }).code === 11000,
+  );
 }
