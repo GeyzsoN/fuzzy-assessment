@@ -21,6 +21,6 @@ export class ListContactsDto {
   search?: string;
 
   @IsOptional()
-  @IsIn(['name', 'createdAt'])
-  sort?: 'name' | 'createdAt' = 'createdAt';
+  @IsIn(['name', 'email', 'company', 'createdAt'])
+  sort?: 'name' | 'email' | 'company' | 'createdAt' = 'createdAt';
 }

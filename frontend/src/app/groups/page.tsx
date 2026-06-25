@@ -2,13 +2,42 @@
 
 import React, { Suspense, useState, useEffect, useCallback, useMemo } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { RefreshCw, Plus, Users, Loader2, AlertCircle, Trash2, UserPlus } from 'lucide-react';
+import {
+  RefreshCw,
+  Plus,
+  Users,
+  Loader2,
+  AlertCircle,
+  Trash2,
+  UserPlus,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
+} from 'lucide-react';
 import Shell from '@/components/shell';
 import { groupsService, contactsService, Group, GroupDetail, Contact } from '@/services/api';
 
 type SortDirection = 'asc' | 'desc';
 type GroupSortKey = 'name' | 'memberCount';
 type MemberSortKey = 'name' | 'email' | 'company';
+
+function SortIcon({
+  active,
+  sortKey,
+}: {
+  active: { key: string; direction: SortDirection };
+  sortKey: string;
+}) {
+  if (active.key !== sortKey) {
+    return <ArrowUpDown className="h-3 w-3 text-slate-300" aria-hidden="true" />;
+  }
+
+  return active.direction === 'asc' ? (
+    <ArrowUp className="h-3 w-3 text-slate-600" aria-hidden="true" />
+  ) : (
+    <ArrowDown className="h-3 w-3 text-slate-600" aria-hidden="true" />
+  );
+}
 
 export default function GroupsPage() {
   return (
@@ -262,11 +291,6 @@ function GroupsPageContent() {
     });
   }, [memberSort, selectedGroupDetail]);
 
-  const sortLabel = (key: string, active: { key: string; direction: SortDirection }) => {
-    if (active.key !== key) return '↕';
-    return active.direction === 'asc' ? '↑' : '↓';
-  };
-
   // Remove Member Handler
   const handleRemoveMember = async (contactId: string) => {
     if (!selectedGroupId) return;
@@ -392,16 +416,16 @@ function GroupsPageContent() {
                   <button
                     type="button"
                     onClick={() => toggleGroupSort('name')}
-                    className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wide text-slate-500 hover:border-slate-300 hover:text-slate-700"
+                    className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wide text-slate-500 hover:border-slate-300 hover:text-slate-700"
                   >
-                    Name {sortLabel('name', groupSort)}
+                    Name <SortIcon active={groupSort} sortKey="name" />
                   </button>
                   <button
                     type="button"
                     onClick={() => toggleGroupSort('memberCount')}
-                    className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wide text-slate-500 hover:border-slate-300 hover:text-slate-700"
+                    className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wide text-slate-500 hover:border-slate-300 hover:text-slate-700"
                   >
-                    Members {sortLabel('memberCount', groupSort)}
+                    Members <SortIcon active={groupSort} sortKey="memberCount" />
                   </button>
                 </div>
               </div>
@@ -599,7 +623,7 @@ function GroupsPageContent() {
                                   onClick={() => toggleMemberSort('name')}
                                   className="inline-flex items-center gap-1 hover:text-slate-700"
                                 >
-                                  Name {sortLabel('name', memberSort)}
+                                  Name <SortIcon active={memberSort} sortKey="name" />
                                 </button>
                               </th>
                               <th className="px-4 py-3">
@@ -608,7 +632,7 @@ function GroupsPageContent() {
                                   onClick={() => toggleMemberSort('email')}
                                   className="inline-flex items-center gap-1 hover:text-slate-700"
                                 >
-                                  Email {sortLabel('email', memberSort)}
+                                  Email <SortIcon active={memberSort} sortKey="email" />
                                 </button>
                               </th>
                               <th className="px-4 py-3">
@@ -617,7 +641,7 @@ function GroupsPageContent() {
                                   onClick={() => toggleMemberSort('company')}
                                   className="inline-flex items-center gap-1 hover:text-slate-700"
                                 >
-                                  Company {sortLabel('company', memberSort)}
+                                  Company <SortIcon active={memberSort} sortKey="company" />
                                 </button>
                               </th>
                               <th className="px-4 py-3 text-right">Action</th>

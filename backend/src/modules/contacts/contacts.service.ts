@@ -34,10 +34,16 @@ export class ContactsService {
       ];
     }
 
-    const sort: Record<string, 1 | -1> =
-      query.sort === 'name'
-        ? { name: 1, _id: 1 }
-        : { createdAt: -1, _id: 1 };
+    const sortBy: Record<
+      NonNullable<ListContactsDto['sort']>,
+      Record<string, 1 | -1>
+    > = {
+      name: { name: 1, _id: 1 },
+      email: { email: 1, _id: 1 },
+      company: { company: 1, _id: 1 },
+      createdAt: { createdAt: -1, _id: 1 },
+    };
+    const sort = sortBy[query.sort || 'createdAt'];
 
     const [items, total] = await Promise.all([
       this.contactModel

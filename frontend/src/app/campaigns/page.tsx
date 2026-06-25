@@ -1,6 +1,6 @@
 'use client';
 
-import React, { Suspense, useState, useEffect, useCallback } from 'react';
+import React, { Suspense, useState, useEffect, useCallback, useMemo } from 'react';
 import Link from 'next/link';
 import Image from 'next/image';
 import { useRouter, useSearchParams } from 'next/navigation';
@@ -22,7 +22,8 @@ import {
   Mail,
   Volume2,
   FileText,
-  UserPlus
+  UserPlus,
+  Search,
 } from 'lucide-react';
 import Shell from '@/components/shell';
 import { campaignsService, groupsService, contactsService, Group, Contact, Campaign, CampaignTemplate } from '@/services/api';
@@ -133,6 +134,15 @@ function readWizardStep(value: string | null) {
   return Math.min(5, Math.max(1, readPositiveInt(value, 1)));
 }
 
+function matchesSearch(query: string, values: Array<string | number | undefined | null>) {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) return true;
+
+  return values.some((value) =>
+    String(value ?? '').toLowerCase().includes(normalized),
+  );
+}
+
 export default function CampaignsPage() {
   return (
     <Suspense fallback={<Shell><div className="text-sm text-slate-500">Loading campaigns...</div></Shell>}>
@@ -183,6 +193,8 @@ function CampaignsPageContent() {
   );
   const [coreGroupIds, setCoreGroupIds] = useState<string[]>([]);
   const [coreContactIds, setCoreContactIds] = useState<string[]>([]);
+  const [coreGroupSearch, setCoreGroupSearch] = useState('');
+  const [coreContactSearch, setCoreContactSearch] = useState('');
   const [coreCreating, setCoreCreating] = useState(false);
   const [coreError, setCoreError] = useState<string | null>(null);
 
@@ -197,6 +209,8 @@ function CampaignsPageContent() {
   const [wizardTone, setWizardTone] = useState('Warm');
   const [wizardSelectedGroupIds, setWizardSelectedGroupIds] = useState<string[]>([]);
   const [wizardSelectedContactIds, setWizardSelectedContactIds] = useState<string[]>([]);
+  const [wizardGroupSearch, setWizardGroupSearch] = useState('');
+  const [wizardContactSearch, setWizardContactSearch] = useState('');
   const [wizardRawImportText, setWizardRawImportText] = useState('');
   
   // Build Mode Choice
@@ -216,6 +230,8 @@ function CampaignsPageContent() {
   ]);
   const [wizardGenerating, setWizardGenerating] = useState(false);
   const [wizardError, setWizardError] = useState<string | null>(null);
+  const [builderGroupSearch, setBuilderGroupSearch] = useState('');
+  const [builderContactSearch, setBuilderContactSearch] = useState('');
 
   const updateCampaignsUrl = useCallback(
     (
@@ -436,6 +452,8 @@ function CampaignsPageContent() {
     setWizardStepsCount(3); // Default to 3 steps for the wizard
     setWizardSelectedGroupIds([]);
     setWizardSelectedContactIds([]);
+    setWizardGroupSearch('');
+    setWizardContactSearch('');
     setWizardRawImportText('');
     setWizardError(null);
     setWizardStep(step);
@@ -642,6 +660,8 @@ function CampaignsPageContent() {
       setWizardRawImportText('');
       setWizardSelectedGroupIds([]);
       setWizardSelectedContactIds([]);
+      setWizardGroupSearch('');
+      setWizardContactSearch('');
       setWizardStepsCount(1);
       
       router.push(`/campaigns/${camp.id}`);
@@ -703,6 +723,8 @@ function CampaignsPageContent() {
       setCorePromptTemplate(DEFAULT_CORE_PROMPT_TEMPLATE);
       setCoreGroupIds([]);
       setCoreContactIds([]);
+      setCoreGroupSearch('');
+      setCoreContactSearch('');
       router.push(`/campaigns/${campaign.id}`);
     } catch (err: any) {
       setCoreError(err.message || 'Failed to create campaign.');
@@ -741,6 +763,8 @@ function CampaignsPageContent() {
       setCampaignName('');
       setSelectedGroupIds([]);
       setSelectedContactIds([]);
+      setBuilderGroupSearch('');
+      setBuilderContactSearch('');
       setSequenceSteps([
         {
           order: 1,
@@ -804,6 +828,81 @@ function CampaignsPageContent() {
   const paginatedCampaigns = filteredCampaigns.slice(
     (campaignPage - 1) * urlLimit,
     campaignPage * urlLimit,
+  );
+
+  const filteredCoreGroups = useMemo(
+    () =>
+      groups.filter((group) =>
+        matchesSearch(coreGroupSearch, [
+          group.name,
+          group.description,
+          group.memberCount,
+        ]),
+      ),
+    [coreGroupSearch, groups],
+  );
+
+  const filteredCoreContacts = useMemo(
+    () =>
+      contacts.filter((contact) =>
+        matchesSearch(coreContactSearch, [
+          contact.name,
+          contact.email,
+          contact.company,
+          contact.title,
+        ]),
+      ),
+    [contacts, coreContactSearch],
+  );
+
+  const filteredBuilderGroups = useMemo(
+    () =>
+      groups.filter((group) =>
+        matchesSearch(builderGroupSearch, [
+          group.name,
+          group.description,
+          group.memberCount,
+        ]),
+      ),
+    [builderGroupSearch, groups],
+  );
+
+  const filteredBuilderContacts = useMemo(
+    () =>
+      contacts.filter((contact) =>
+        matchesSearch(builderContactSearch, [
+          contact.name,
+          contact.email,
+          contact.company,
+          contact.title,
+        ]),
+      ),
+    [builderContactSearch, contacts],
+  );
+
+  const filteredWizardGroups = useMemo(
+    () =>
+      groups.filter((group) =>
+        matchesSearch(wizardGroupSearch, [
+          group.name,
+          group.description,
+          group.memberCount,
+        ]),
+      ),
+    [groups, wizardGroupSearch],
+  );
+
+  const filteredWizardContacts = useMemo(
+    () =>
+      contacts.filter((contact) =>
+        matchesSearch(wizardContactSearch, [
+          contact.name,
+          contact.email,
+          contact.company,
+          contact.title,
+        ]),
+      ),
+    [contacts, wizardContactSearch],
   );
 
   useEffect(() => {
@@ -907,22 +1006,38 @@ function CampaignsPageContent() {
                 <div className="text-xs text-slate-400 italic">No groups available.</div>
               ) : (
                 <div className="space-y-2 max-h-36 overflow-y-auto p-3 border border-slate-200/80 rounded-xl bg-white">
-                  {groups.map((group) => (
-                    <label
-                      key={group.id}
-                      className="flex items-center space-x-2.5 text-xs text-slate-700 select-none transition-colors cursor-pointer hover:text-indigo-600"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={coreGroupIds.includes(group.id)}
-                        onChange={() => handleCoreGroupToggle(group.id)}
-                        className="h-4 w-4 text-indigo-600 accent-indigo-600 border-slate-300 rounded focus:ring-0"
-                      />
-                      <span className="font-semibold">
-                        {group.name} ({group.memberCount} contacts)
-                      </span>
-                    </label>
-                  ))}
+                  <div className="relative">
+                    <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-300" />
+                    <input
+                      type="text"
+                      value={coreGroupSearch}
+                      onChange={(event) => setCoreGroupSearch(event.target.value)}
+                      placeholder="Search groups..."
+                      className="w-full rounded-lg border border-slate-200 bg-slate-50/60 py-2 pl-8 pr-3 text-xs font-medium text-slate-700 outline-none transition-all focus:border-indigo-500 focus:bg-white focus:ring-2 focus:ring-indigo-100"
+                    />
+                  </div>
+                  {filteredCoreGroups.length === 0 ? (
+                    <div className="py-3 text-center text-xs font-semibold text-slate-400">
+                      No groups match that search.
+                    </div>
+                  ) : (
+                    filteredCoreGroups.map((group) => (
+                      <label
+                        key={group.id}
+                        className="flex items-center space-x-2.5 text-xs text-slate-700 select-none transition-colors cursor-pointer hover:text-indigo-600"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={coreGroupIds.includes(group.id)}
+                          onChange={() => handleCoreGroupToggle(group.id)}
+                          className="h-4 w-4 text-indigo-600 accent-indigo-600 border-slate-300 rounded focus:ring-0"
+                        />
+                        <span className="font-semibold">
+                          {group.name} ({group.memberCount} contacts)
+                        </span>
+                      </label>
+                    ))
+                  )}
                 </div>
               )}
             </div>
@@ -935,25 +1050,41 @@ function CampaignsPageContent() {
                 <div className="text-xs text-slate-400 italic">No contacts available.</div>
               ) : (
                 <div className="space-y-2 max-h-44 overflow-y-auto p-3 border border-slate-200/80 rounded-xl bg-white">
-                  {contacts.map((contact) => (
-                    <label
-                      key={contact.id}
-                      className={`flex items-center space-x-2.5 text-xs text-slate-700 select-none transition-colors ${
-                        contact.suppressed ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:text-indigo-600'
-                      }`}
-                    >
-                      <input
-                        type="checkbox"
-                        disabled={contact.suppressed}
-                        checked={coreContactIds.includes(contact.id)}
-                        onChange={() => handleCoreContactToggle(contact.id)}
-                        className="h-4 w-4 text-indigo-600 accent-indigo-600 border-slate-300 rounded focus:ring-0 disabled:border-slate-200"
-                      />
-                      <span className="font-semibold">
-                        {contact.name} {contact.suppressed ? '(Suppressed)' : `(${contact.email})`}
-                      </span>
-                    </label>
-                  ))}
+                  <div className="relative">
+                    <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-300" />
+                    <input
+                      type="text"
+                      value={coreContactSearch}
+                      onChange={(event) => setCoreContactSearch(event.target.value)}
+                      placeholder="Search contacts..."
+                      className="w-full rounded-lg border border-slate-200 bg-slate-50/60 py-2 pl-8 pr-3 text-xs font-medium text-slate-700 outline-none transition-all focus:border-indigo-500 focus:bg-white focus:ring-2 focus:ring-indigo-100"
+                    />
+                  </div>
+                  {filteredCoreContacts.length === 0 ? (
+                    <div className="py-3 text-center text-xs font-semibold text-slate-400">
+                      No contacts match that search.
+                    </div>
+                  ) : (
+                    filteredCoreContacts.map((contact) => (
+                      <label
+                        key={contact.id}
+                        className={`flex items-center space-x-2.5 text-xs text-slate-700 select-none transition-colors ${
+                          contact.suppressed ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:text-indigo-600'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          disabled={contact.suppressed}
+                          checked={coreContactIds.includes(contact.id)}
+                          onChange={() => handleCoreContactToggle(contact.id)}
+                          className="h-4 w-4 text-indigo-600 accent-indigo-600 border-slate-300 rounded focus:ring-0 disabled:border-slate-200"
+                        />
+                        <span className="font-semibold">
+                          {contact.name} {contact.suppressed ? '(Suppressed)' : `(${contact.email})`}
+                        </span>
+                      </label>
+                    ))
+                  )}
                 </div>
               )}
             </div>
@@ -1249,17 +1380,33 @@ function CampaignsPageContent() {
                     <div className="text-xs text-slate-400 italic">No segment groups available. Create one in Groups page first.</div>
                   ) : (
                     <div className="space-y-2 max-h-40 overflow-y-auto p-3 border border-slate-200/80 rounded-xl bg-slate-50/30">
-                      {groups.map(group => (
-                        <label key={group.id} className="flex items-center space-x-2.5 text-xs text-slate-700 cursor-pointer select-none hover:text-indigo-600 transition-colors">
-                          <input
-                            type="checkbox"
-                            checked={selectedGroupIds.includes(group.id)}
-                            onChange={() => handleGroupToggle(group.id)}
-                            className="h-4 w-4 text-indigo-600 accent-indigo-600 border-slate-300 rounded focus:ring-0"
-                          />
-                          <span className="font-semibold">{group.name} ({group.memberCount} members)</span>
-                        </label>
-                      ))}
+                      <div className="relative">
+                        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-300" />
+                        <input
+                          type="text"
+                          value={builderGroupSearch}
+                          onChange={(event) => setBuilderGroupSearch(event.target.value)}
+                          placeholder="Search groups..."
+                          className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-8 pr-3 text-xs font-medium text-slate-700 outline-none transition-all focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
+                        />
+                      </div>
+                      {filteredBuilderGroups.length === 0 ? (
+                        <div className="py-3 text-center text-xs font-semibold text-slate-400">
+                          No groups match that search.
+                        </div>
+                      ) : (
+                        filteredBuilderGroups.map(group => (
+                          <label key={group.id} className="flex items-center space-x-2.5 text-xs text-slate-700 cursor-pointer select-none hover:text-indigo-600 transition-colors">
+                            <input
+                              type="checkbox"
+                              checked={selectedGroupIds.includes(group.id)}
+                              onChange={() => handleGroupToggle(group.id)}
+                              className="h-4 w-4 text-indigo-600 accent-indigo-600 border-slate-300 rounded focus:ring-0"
+                            />
+                            <span className="font-semibold">{group.name} ({group.memberCount} members)</span>
+                          </label>
+                        ))
+                      )}
                     </div>
                   )}
                 </div>
@@ -1273,23 +1420,39 @@ function CampaignsPageContent() {
                     <div className="text-xs text-slate-400 italic">No contacts available. Create some in Contacts page.</div>
                   ) : (
                     <div className="space-y-2 max-h-40 overflow-y-auto p-3 border border-slate-200/80 rounded-xl bg-slate-50/30">
-                      {contacts.map(contact => (
-                        <label
-                          key={contact.id}
-                          className={`flex items-center space-x-2.5 text-xs text-slate-700 select-none transition-colors hover:text-indigo-600 ${contact.suppressed ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
-                        >
-                          <input
-                            type="checkbox"
-                            disabled={contact.suppressed}
-                            checked={selectedContactIds.includes(contact.id)}
-                            onChange={() => handleContactToggle(contact.id)}
-                            className="h-4 w-4 text-indigo-600 accent-indigo-600 border-slate-300 rounded focus:ring-0 disabled:border-slate-200"
-                          />
-                          <span className="font-semibold">
-                            {contact.name} {contact.suppressed ? '(Suppressed)' : `(${contact.email})`}
-                          </span>
-                        </label>
-                      ))}
+                      <div className="relative">
+                        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-300" />
+                        <input
+                          type="text"
+                          value={builderContactSearch}
+                          onChange={(event) => setBuilderContactSearch(event.target.value)}
+                          placeholder="Search contacts..."
+                          className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-8 pr-3 text-xs font-medium text-slate-700 outline-none transition-all focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
+                        />
+                      </div>
+                      {filteredBuilderContacts.length === 0 ? (
+                        <div className="py-3 text-center text-xs font-semibold text-slate-400">
+                          No contacts match that search.
+                        </div>
+                      ) : (
+                        filteredBuilderContacts.map(contact => (
+                          <label
+                            key={contact.id}
+                            className={`flex items-center space-x-2.5 text-xs text-slate-700 select-none transition-colors hover:text-indigo-600 ${contact.suppressed ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                          >
+                            <input
+                              type="checkbox"
+                              disabled={contact.suppressed}
+                              checked={selectedContactIds.includes(contact.id)}
+                              onChange={() => handleContactToggle(contact.id)}
+                              className="h-4 w-4 text-indigo-600 accent-indigo-600 border-slate-300 rounded focus:ring-0 disabled:border-slate-200"
+                            />
+                            <span className="font-semibold">
+                              {contact.name} {contact.suppressed ? '(Suppressed)' : `(${contact.email})`}
+                            </span>
+                          </label>
+                        ))
+                      )}
                     </div>
                   )}
                 </div>
@@ -1702,19 +1865,35 @@ function CampaignsPageContent() {
                             <span className="text-[11px] text-slate-400 italic">No groups. Set up groups first.</span>
                           ) : (
                             <div className="space-y-2 max-h-32 overflow-y-auto">
-                              {groups.map(group => (
-                                <label key={group.id} className="flex items-center space-x-2.5 text-xs text-slate-700 cursor-pointer select-none">
-                                  <input
-                                    type="checkbox"
-                                    checked={wizardSelectedGroupIds.includes(group.id)}
-                                    onChange={() => setWizardSelectedGroupIds(prev =>
-                                      prev.includes(group.id) ? prev.filter(id => id !== group.id) : [...prev, group.id]
-                                    )}
-                                    className="h-4 w-4 text-indigo-600 accent-indigo-600 border-slate-300 rounded"
-                                  />
-                                  <span className="font-semibold">{group.name} ({group.memberCount} members)</span>
-                                </label>
-                              ))}
+                              <div className="relative">
+                                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-300" />
+                                <input
+                                  type="text"
+                                  value={wizardGroupSearch}
+                                  onChange={(event) => setWizardGroupSearch(event.target.value)}
+                                  placeholder="Search groups..."
+                                  className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-8 pr-3 text-xs font-medium text-slate-700 outline-none transition-all focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
+                                />
+                              </div>
+                              {filteredWizardGroups.length === 0 ? (
+                                <div className="py-3 text-center text-xs font-semibold text-slate-400">
+                                  No groups match that search.
+                                </div>
+                              ) : (
+                                filteredWizardGroups.map(group => (
+                                  <label key={group.id} className="flex items-center space-x-2.5 text-xs text-slate-700 cursor-pointer select-none">
+                                    <input
+                                      type="checkbox"
+                                      checked={wizardSelectedGroupIds.includes(group.id)}
+                                      onChange={() => setWizardSelectedGroupIds(prev =>
+                                        prev.includes(group.id) ? prev.filter(id => id !== group.id) : [...prev, group.id]
+                                      )}
+                                      className="h-4 w-4 text-indigo-600 accent-indigo-600 border-slate-300 rounded"
+                                    />
+                                    <span className="font-semibold">{group.name} ({group.memberCount} members)</span>
+                                  </label>
+                                ))
+                              )}
                             </div>
                           )}
                         </div>
@@ -1727,19 +1906,35 @@ function CampaignsPageContent() {
                             <span className="text-[11px] text-slate-400 italic">No contacts registered yet.</span>
                           ) : (
                             <div className="space-y-2 max-h-32 overflow-y-auto">
-                              {contacts.map(c => (
-                                <label key={c.id} className="flex items-center space-x-2.5 text-xs text-slate-700 cursor-pointer select-none">
-                                  <input
-                                    type="checkbox"
-                                    checked={wizardSelectedContactIds.includes(c.id)}
-                                    onChange={() => setWizardSelectedContactIds(prev =>
-                                      prev.includes(c.id) ? prev.filter(id => id !== c.id) : [...prev, c.id]
-                                    )}
-                                    className="h-4 w-4 text-indigo-600 accent-indigo-600 border-slate-300 rounded"
-                                  />
-                                  <span className="font-semibold">{c.name} ({c.company || 'Direct'})</span>
-                                </label>
-                              ))}
+                              <div className="relative">
+                                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-300" />
+                                <input
+                                  type="text"
+                                  value={wizardContactSearch}
+                                  onChange={(event) => setWizardContactSearch(event.target.value)}
+                                  placeholder="Search contacts..."
+                                  className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-8 pr-3 text-xs font-medium text-slate-700 outline-none transition-all focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
+                                />
+                              </div>
+                              {filteredWizardContacts.length === 0 ? (
+                                <div className="py-3 text-center text-xs font-semibold text-slate-400">
+                                  No contacts match that search.
+                                </div>
+                              ) : (
+                                filteredWizardContacts.map(c => (
+                                  <label key={c.id} className="flex items-center space-x-2.5 text-xs text-slate-700 cursor-pointer select-none">
+                                    <input
+                                      type="checkbox"
+                                      checked={wizardSelectedContactIds.includes(c.id)}
+                                      onChange={() => setWizardSelectedContactIds(prev =>
+                                        prev.includes(c.id) ? prev.filter(id => id !== c.id) : [...prev, c.id]
+                                      )}
+                                      className="h-4 w-4 text-indigo-600 accent-indigo-600 border-slate-300 rounded"
+                                    />
+                                    <span className="font-semibold">{c.name} ({c.company || 'Direct'})</span>
+                                  </label>
+                                ))
+                              )}
                             </div>
                           )}
                         </div>

@@ -25,7 +25,7 @@ export interface ListContactsParams {
   page?: number;
   limit?: number;
   search?: string;
-  sort?: 'name' | 'createdAt';
+  sort?: 'name' | 'email' | 'company' | 'createdAt';
 }
 
 export interface CreateContactBody {

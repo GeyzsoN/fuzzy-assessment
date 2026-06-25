@@ -2,12 +2,23 @@
 
 import React, { Suspense, useState, useEffect, useCallback } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { RefreshCw, Search, Plus, Loader2, AlertCircle, Check } from 'lucide-react';
+import {
+  RefreshCw,
+  Search,
+  Plus,
+  Loader2,
+  AlertCircle,
+  Check,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
+} from 'lucide-react';
 import Shell from '@/components/shell';
 import { useContacts } from '@/hooks/useContacts';
 
 const DEFAULT_LIMIT = 10;
 const ALLOWED_LIMITS = [10, 20, 50];
+type ContactSort = 'name' | 'email' | 'company' | 'createdAt';
 
 function readPositiveInt(value: string | null, fallback: number) {
   const parsed = Number(value);
@@ -17,6 +28,30 @@ function readPositiveInt(value: string | null, fallback: number) {
 function readLimit(value: string | null) {
   const parsed = readPositiveInt(value, DEFAULT_LIMIT);
   return ALLOWED_LIMITS.includes(parsed) ? parsed : DEFAULT_LIMIT;
+}
+
+function readContactsSort(value: string | null): ContactSort {
+  return ['name', 'email', 'company', 'createdAt'].includes(value || '')
+    ? (value as ContactSort)
+    : 'name';
+}
+
+function ContactsSortIcon({
+  activeSort,
+  sortKey,
+}: {
+  activeSort: ContactSort;
+  sortKey: ContactSort;
+}) {
+  if (activeSort !== sortKey) {
+    return <ArrowUpDown className="h-3.5 w-3.5 text-slate-300" aria-hidden="true" />;
+  }
+
+  return sortKey === 'createdAt' ? (
+    <ArrowDown className="h-3.5 w-3.5 text-slate-600" aria-hidden="true" />
+  ) : (
+    <ArrowUp className="h-3.5 w-3.5 text-slate-600" aria-hidden="true" />
+  );
 }
 
 export default function ContactsPage() {
@@ -34,6 +69,7 @@ function ContactsPageContent() {
   const urlPage = readPositiveInt(searchParams.get('page'), 1);
   const urlLimit = readLimit(searchParams.get('limit'));
   const activeSearch = searchParams.get('search') || '';
+  const activeSort = readContactsSort(searchParams.get('sort'));
 
   const [createSuccess, setCreateSuccess] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -60,7 +96,7 @@ function ContactsPageContent() {
     page: urlPage,
     limit: urlLimit,
     search: activeSearch,
-    sort: 'name',
+    sort: activeSort,
   });
 
   const contacts = (data?.items || []).map((contact) => ({
@@ -77,14 +113,16 @@ function ContactsPageContent() {
   const pageCount = Math.max(1, Math.ceil(totalCount / (data?.limit || urlLimit)));
 
   const updateListUrl = useCallback(
-    (next: { page?: number; limit?: number; search?: string }) => {
+    (next: { page?: number; limit?: number; search?: string; sort?: ContactSort }) => {
       const params = new URLSearchParams(searchParams.toString());
       const nextPage = next.page ?? urlPage;
       const nextLimit = next.limit ?? urlLimit;
       const nextSearch = next.search ?? activeSearch;
+      const nextSort = next.sort ?? activeSort;
 
       params.set('page', String(Math.max(1, nextPage)));
       params.set('limit', String(nextLimit));
+      params.set('sort', nextSort);
       if (nextSearch.trim()) {
         params.set('search', nextSearch.trim());
       } else {
@@ -93,7 +131,7 @@ function ContactsPageContent() {
 
       router.push(`/contacts?${params.toString()}`, { scroll: false });
     },
-    [activeSearch, router, searchParams, urlLimit, urlPage],
+    [activeSearch, activeSort, router, searchParams, urlLimit, urlPage],
   );
 
   useEffect(() => {
@@ -108,11 +146,15 @@ function ContactsPageContent() {
       params.set('limit', String(urlLimit));
       changed = true;
     }
+    if (params.get('sort') !== activeSort) {
+      params.set('sort', activeSort);
+      changed = true;
+    }
 
     if (changed) {
       router.replace(`/contacts?${params.toString()}`, { scroll: false });
     }
-  }, [queryString, router, urlLimit, urlPage]);
+  }, [activeSort, queryString, router, urlLimit, urlPage]);
 
   useEffect(() => {
     setSearchQuery(activeSearch);
@@ -123,9 +165,9 @@ function ContactsPageContent() {
       page: urlPage,
       limit: urlLimit,
       search: activeSearch,
-      sort: 'name',
+      sort: activeSort,
     });
-  }, [activeSearch, setParams, urlLimit, urlPage]);
+  }, [activeSearch, activeSort, setParams, urlLimit, urlPage]);
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -134,6 +176,10 @@ function ContactsPageContent() {
 
   const handleRefresh = () => {
     reload();
+  };
+
+  const handleSortChange = (sort: ContactSort) => {
+    updateListUrl({ page: 1, sort });
   };
 
   const handleCreateContact = async (e: React.FormEvent) => {
@@ -367,11 +413,43 @@ function ContactsPageContent() {
                 <table className="w-full text-left border-collapse">
                   <thead>
                     <tr className="bg-slate-55 border-b border-slate-200 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                      <th className="px-6 py-4">Name / Title</th>
-                      <th className="px-6 py-4">Email</th>
-                      <th className="px-6 py-4">Company</th>
+                      <th className="px-6 py-4">
+                        <button
+                          type="button"
+                          onClick={() => handleSortChange('name')}
+                          className="inline-flex items-center gap-1 hover:text-slate-700"
+                        >
+                          Name / Title <ContactsSortIcon activeSort={activeSort} sortKey="name" />
+                        </button>
+                      </th>
+                      <th className="px-6 py-4">
+                        <button
+                          type="button"
+                          onClick={() => handleSortChange('email')}
+                          className="inline-flex items-center gap-1 hover:text-slate-700"
+                        >
+                          Email <ContactsSortIcon activeSort={activeSort} sortKey="email" />
+                        </button>
+                      </th>
+                      <th className="px-6 py-4">
+                        <button
+                          type="button"
+                          onClick={() => handleSortChange('company')}
+                          className="inline-flex items-center gap-1 hover:text-slate-700"
+                        >
+                          Company <ContactsSortIcon activeSort={activeSort} sortKey="company" />
+                        </button>
+                      </th>
                       <th className="px-6 py-4 text-center">Status</th>
-                      <th className="px-6 py-4 text-right">Created</th>
+                      <th className="px-6 py-4 text-right">
+                        <button
+                          type="button"
+                          onClick={() => handleSortChange('createdAt')}
+                          className="ml-auto inline-flex items-center gap-1 hover:text-slate-700"
+                        >
+                          Created <ContactsSortIcon activeSort={activeSort} sortKey="createdAt" />
+                        </button>
+                      </th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-150 text-slate-700 text-sm">
