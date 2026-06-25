@@ -1,8 +1,13 @@
-import { IsEmail, IsNotEmpty, IsOptional, IsString } from 'class-validator';
+import {
+  IsBoolean,
+  IsEmail,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+} from 'class-validator';
 
 /**
- * STARTER DTO. Bad input must yield a 400 (the global ValidationPipe handles this
- * once your decorators are correct). Add/adjust validation as you see fit.
+ * Contact creation DTO. The global ValidationPipe turns invalid input into 400s.
  */
 export class CreateContactDto {
   @IsString()
@@ -19,4 +24,8 @@ export class CreateContactDto {
   @IsOptional()
   @IsString()
   title?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  doNotContact?: boolean;
 }

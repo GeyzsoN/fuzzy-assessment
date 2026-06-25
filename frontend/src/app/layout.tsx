@@ -1,26 +1,18 @@
-import type { ReactNode } from 'react';
-import Link from 'next/link';
+import type { Metadata } from 'next';
+import './globals.css';
+import { AuthProvider } from '@/hooks/use-auth';
 
-export const metadata = {
-  title: 'Mini Outreach Sequencer',
+export const metadata: Metadata = {
+  title: 'Campaign Sequencer',
+  description:
+    'Manage contacts, groups, and AI-assisted outreach campaign sequences.',
 };
 
-export default function RootLayout({ children }: { children: ReactNode }) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <body style={{ fontFamily: 'system-ui, sans-serif', margin: 0 }}>
-        <nav
-          style={{
-            display: 'flex',
-            gap: 16,
-            padding: '12px 24px',
-            borderBottom: '1px solid #eee',
-          }}
-        >
-          <Link href="/">Home</Link>
-          <Link href="/contacts">Contacts</Link>
-        </nav>
-        <main style={{ padding: 24 }}>{children}</main>
+      <body className="font-sans antialiased bg-slate-50 text-slate-900">
+        <AuthProvider>{children}</AuthProvider>
       </body>
     </html>
   );

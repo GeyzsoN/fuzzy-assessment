@@ -27,7 +27,7 @@ export class LlmService {
   constructor() {
     this.provider = (process.env.LLM_PROVIDER || 'anthropic').toLowerCase();
     this.model = process.env.LLM_MODEL || this.defaultModel();
-    this.maxTokens = Number(process.env.LLM_MAX_TOKENS || 300);
+    this.maxTokens = Number(process.env.LLM_MAX_TOKENS || 900);
   }
 
   private defaultModel(): string {
@@ -50,16 +50,68 @@ export class LlmService {
    * Throws on provider/network error — callers decide how to handle that.
    */
   async complete(prompt: string): Promise<string> {
-    switch (this.provider) {
-      case 'openai':
-        return this.completeOpenai(prompt);
-      case 'gemini':
-        return this.completeGemini(prompt);
-      case 'anthropic':
-        return this.completeAnthropic(prompt);
-      default:
-        throw new Error(`Unknown LLM_PROVIDER: ${this.provider}`);
+    return this.retryTransient(async () => {
+      switch (this.provider) {
+        case 'openai':
+          return this.completeOpenai(prompt);
+        case 'gemini':
+          return this.completeGemini(prompt);
+        case 'anthropic':
+          return this.completeAnthropic(prompt);
+        default:
+          throw new Error(`Unknown LLM_PROVIDER: ${this.provider}`);
+      }
+    });
+  }
+
+  private async retryTransient<T>(operation: () => Promise<T>): Promise<T> {
+    const maxAttempts = 3;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        return await operation();
+      } catch (error) {
+        if (attempt === maxAttempts || !this.isTransientError(error)) {
+          throw error;
+        }
+
+        this.logger.warn(
+          `Transient LLM transport error on attempt ${attempt}; retrying.`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, attempt * 300));
+      }
     }
+
+    throw new Error('LLM retry loop exited unexpectedly');
+  }
+
+  private isTransientError(error: unknown): boolean {
+    const candidate = error as {
+      status?: number;
+      code?: string;
+      error?: { code?: string };
+      message?: string;
+    };
+    const code = candidate?.error?.code || candidate?.code || '';
+
+    if (
+      ['insufficient_quota', 'invalid_api_key', 'model_not_found'].includes(code)
+    ) {
+      return false;
+    }
+
+    if (
+      candidate?.status &&
+      candidate.status < 500 &&
+      candidate.status !== 408 &&
+      candidate.status !== 429
+    ) {
+      return false;
+    }
+
+    return /premature close|fetch failed|socket hang up|ECONNRESET|ETIMEDOUT|terminated/i.test(
+      candidate?.message || code,
+    );
   }
 
   // --- Anthropic -----------------------------------------------------------
@@ -82,7 +134,12 @@ export class LlmService {
   // --- OpenAI --------------------------------------------------------------
   private async completeOpenai(prompt: string): Promise<string> {
     const OpenAI = (await import('openai')).default;
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const client = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+      fetch: globalThis.fetch as any,
+      maxRetries: 2,
+      timeout: 12000,
+    });
     const res = await client.chat.completions.create({
       model: this.model,
       max_tokens: this.maxTokens,

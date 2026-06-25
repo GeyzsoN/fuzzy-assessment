@@ -3,19 +3,15 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   contactsApi,
+  CreateContactBody,
   Contact,
   ListContactsParams,
 } from '@/services/contacts';
 import { ApiError } from '@/services/api';
 
 /**
- * EXAMPLE hook — this is the pattern to follow for data fetching.
- *
- * A hook owns: the data, loading state, and error state. Components consume the
- * hook and render; they never call `fetch` or the service directly. Note the
- * loading flag is reset on BOTH success and error.
- *
- * Use this as a template for the campaign detail page's hook(s) too.
+ * Contacts data hook. Components use this instead of calling fetch/services
+ * directly so loading, error, refetch, and create state stay in one place.
  */
 export function useContacts(initial: ListContactsParams = {}) {
   const [data, setData] = useState<{
@@ -26,7 +22,9 @@ export function useContacts(initial: ListContactsParams = {}) {
   } | null>(null);
   const [params, setParams] = useState<ListContactsParams>(initial);
   const [loading, setLoading] = useState(false);
+  const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -50,5 +48,35 @@ export function useContacts(initial: ListContactsParams = {}) {
     load();
   }, [load]);
 
-  return { data, loading, error, params, setParams, reload: load };
+  const createContact = useCallback(
+    async (body: CreateContactBody) => {
+      setCreating(true);
+      setCreateError(null);
+      try {
+        await contactsApi.create(body);
+        await load();
+        return true;
+      } catch (e) {
+        setCreateError(
+          e instanceof ApiError ? e.message : 'Failed to create contact',
+        );
+        return false;
+      } finally {
+        setCreating(false);
+      }
+    },
+    [load],
+  );
+
+  return {
+    data,
+    loading,
+    creating,
+    error,
+    createError,
+    params,
+    setParams,
+    reload: load,
+    createContact,
+  };
 }

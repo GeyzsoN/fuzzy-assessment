@@ -1,11 +1,7 @@
 import { IsIn, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 
 /**
- * STARTER query DTO for the paginated list.
- *
- * TODO(candidate): use these (and add what you need) to build a STABLE paginated
- * query. Remember: the same contact must never appear on two pages as records are
- * added. Think hard about the sort.
+ * Query DTO for the stable paginated contacts list.
  */
 export class ListContactsDto {
   @IsOptional()

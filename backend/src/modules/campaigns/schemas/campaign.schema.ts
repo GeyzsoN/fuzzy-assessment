@@ -12,13 +12,36 @@ export enum GenerationStatus {
   FAILED = 'failed',
 }
 
+export enum CampaignStatus {
+  GENERATING = 'generating',
+  DRAFT = 'draft',
+  LAUNCHING = 'launching',
+  RUNNING = 'running',
+  COMPLETED = 'completed',
+  FAILED = 'failed',
+}
+
+@Schema({ _id: false })
+export class SequenceStep {
+  @Prop({ required: true })
+  stepId: string;
+
+  @Prop({ required: true })
+  order: number;
+
+  @Prop({ required: true, default: 0 })
+  delayMinutes: number;
+
+  @Prop({ required: true })
+  subjectTemplate: string;
+
+  @Prop({ required: true })
+  promptTemplate: string;
+}
+export const SequenceStepSchema = SchemaFactory.createForClass(SequenceStep);
+
 /**
- * STARTER schema. A campaign has a prompt template and a set of attached contacts,
- * each with its own generated message + status.
- *
- * TODO(candidate): model this however you think is cleanest. The embedded
- * sub-document below is a suggestion, not a requirement — you may normalize it
- * into its own collection if you prefer. Be ready to defend the choice.
+ * Embedded campaign contact state for the required per-contact generation flow.
  */
 @Schema({ _id: false })
 export class CampaignContact {
@@ -44,13 +67,40 @@ export class Campaign {
   @Prop({ required: true })
   name: string;
 
-  /** e.g. "Write a 2-sentence opener for {{name}}, a {{title}} at {{company}}." */
-  @Prop({ required: true })
-  promptTemplate: string;
+  @Prop({ type: String, enum: CampaignStatus, default: CampaignStatus.DRAFT })
+  status: CampaignStatus;
+
+  /** First-step email body template, e.g. "Hi {{first_name}}, ..." */
+  @Prop()
+  promptTemplate?: string;
+
+  @Prop({ type: [Types.ObjectId], ref: 'ContactGroup', default: [] })
+  targetGroupIds: Types.ObjectId[];
+
+  @Prop({ type: [Types.ObjectId], ref: 'Contact', default: [] })
+  directContactIds: Types.ObjectId[];
+
+  @Prop({ type: [SequenceStepSchema], default: [] })
+  sequenceSteps: SequenceStep[];
 
   @Prop({ type: [CampaignContactSchema], default: [] })
   contacts: CampaignContact[];
+
+  @Prop()
+  launchedAt?: Date;
+
+  @Prop()
+  completedAt?: Date;
+
+  @Prop()
+  generationError?: string;
+
+  @Prop()
+  generatedAt?: Date;
 }
 
 export type CampaignDocument = Campaign & Document;
 export const CampaignSchema = SchemaFactory.createForClass(Campaign);
+
+CampaignSchema.index({ userId: 1, createdAt: -1, _id: 1 });
+CampaignSchema.index({ userId: 1, status: 1, createdAt: -1, _id: 1 });

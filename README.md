@@ -2,7 +2,7 @@
 
 Welcome, and thanks for taking the time. This is a **full-stack** exercise that mirrors the
 real shape of the system you'd be working on: a NestJS + MongoDB backend, a Next.js frontend,
-and one server-side LLM call that personalizes outreach copy.
+Redis-backed background jobs, and server-side LLM calls that personalize outreach copy.
 
 It is **AI-assisted by design.** Use Claude Code, Cursor, Copilot — whatever you normally
 reach for. We care about the system you build and the decisions you make, not whether you
@@ -25,7 +25,7 @@ You do **not** start from a blank page. This repo gives you:
   (Anthropic / OpenAI / Gemini) pre-installed and wired** behind an `LlmService`.
 - A running **Next.js 15** frontend (`/frontend`) with a service layer + an example hook
   pattern to follow.
-- Seed-free local Mongo via Docker.
+- Local Mongo and Redis via Docker.
 
 See [SETUP.md](./SETUP.md) to get both running (should take < 5 minutes).
 
@@ -33,9 +33,10 @@ See [SETUP.md](./SETUP.md) to get both running (should take < 5 minutes).
 
 Build a small app that lets a user:
 1. Manage a list of **contacts** (create + paginated, searchable list).
-2. Create a **campaign** with a prompt template.
+2. Group contacts and create a **campaign** with a prompt/sequence template.
 3. Attach contacts to a campaign and **generate an AI-personalized opening message** for each
    one, from the contact's data + the template.
+4. Extended product slice: launch a queued simulated email sequence with recipient dedupe.
 
 Full requirements: **[docs/TASK.md](./docs/TASK.md)** — read this next.
 

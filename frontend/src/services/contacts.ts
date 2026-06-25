@@ -1,8 +1,7 @@
 import { request } from './api';
 
 /**
- * STARTER service layer for contacts. Fill in the calls your pages need.
- * Keep types honest — they should match the API responses.
+ * Contacts service layer used by hooks/components instead of raw fetch calls.
  */
 
 export interface Contact {
@@ -11,6 +10,7 @@ export interface Contact {
   email: string;
   company?: string;
   title?: string;
+  doNotContact?: boolean;
   createdAt: string;
 }
 
@@ -28,6 +28,14 @@ export interface ListContactsParams {
   sort?: 'name' | 'createdAt';
 }
 
+export interface CreateContactBody {
+  name: string;
+  email: string;
+  company?: string;
+  title?: string;
+  doNotContact?: boolean;
+}
+
 export const contactsApi = {
   list(params: ListContactsParams = {}): Promise<PaginatedContacts> {
     const qs = new URLSearchParams(
@@ -38,12 +46,7 @@ export const contactsApi = {
     return request<PaginatedContacts>(`/contacts${qs ? `?${qs}` : ''}`);
   },
 
-  create(body: {
-    name: string;
-    email: string;
-    company?: string;
-    title?: string;
-  }): Promise<Contact> {
+  create(body: CreateContactBody): Promise<Contact> {
     return request<Contact>('/contacts', {
       method: 'POST',
       body: JSON.stringify(body),

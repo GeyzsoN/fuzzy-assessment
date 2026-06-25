@@ -5,6 +5,8 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { Request } from 'express';
+import { verifySessionToken } from './token';
+import { SessionUser } from './session-user';
 
 /**
  * Lightweight auth stand-in for the assessment.
@@ -20,12 +22,31 @@ import { Request } from 'express';
 @Injectable()
 export class UserGuard implements CanActivate {
   canActivate(context: ExecutionContext): boolean {
-    const req = context.switchToHttp().getRequest<Request & { userId?: string }>();
+    const req = context.switchToHttp().getRequest<
+      Request & { userId?: string; user?: SessionUser }
+    >();
+    const authorization = req.header('authorization');
+    const bearerToken = authorization?.startsWith('Bearer ')
+      ? authorization.slice('Bearer '.length)
+      : undefined;
+    const sessionUser = bearerToken ? verifySessionToken(bearerToken) : null;
+    if (sessionUser) {
+      req.user = sessionUser;
+      req.userId = sessionUser.id;
+      return true;
+    }
+
     const userId = req.header('x-user-id');
     if (!userId) {
-      throw new UnauthorizedException('Missing x-user-id header');
+      throw new UnauthorizedException('Missing bearer token or x-user-id header');
     }
     req.userId = userId;
+    req.user = {
+      id: userId,
+      email: `${userId}@local`,
+      name: userId,
+      role: 'user',
+    };
     return true;
   }
 }
