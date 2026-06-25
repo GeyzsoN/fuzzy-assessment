@@ -27,7 +27,7 @@ The required Bladen take-home flow is implemented first. Groups, sequences, outb
 - [x] Contacts page: paginated, searchable table
 - [x] Contacts page: create form, including suppression flag
 - [x] Data access via services + hooks
-- [x] Campaigns page: required core form for name + promptTemplate + attached contacts
+- [x] Campaigns page: campaign list plus wizard entry for creating campaign drafts
 - [x] Campaign detail page: attached contacts, per-contact generation, plus extension launch/sequence/outbox views
 - [x] Generate button per contact with loading/result/error states
 
@@ -68,5 +68,5 @@ Seeded login:
 
 - Real email sending is intentionally not implemented. This avoids accidental delivery and keeps the assessment locally testable.
 - Reply tracking, unsubscribe handling, bounce processing, provider webhooks, and deliverability controls are future production work.
-- Groups, sequences, outbox, Redis/BullMQ, and the wizard are beyond the original brief; the required core remains available and visible from `/campaigns`.
+- Groups, sequences, outbox, Redis/BullMQ, and the wizard are beyond the original brief; the required backend endpoints remain available, and the reviewer-facing UI focuses on the wizard plus campaign detail generation flow.
 - Campaign generation is intentionally asynchronous so the UI can show `generating` immediately and poll the campaign detail page until it becomes `draft` or `failed`.
