@@ -121,7 +121,7 @@ export class CampaignsService implements OnModuleInit {
       targetGroupIds: toObjectIds(dto.groupIds || [], 'group'),
       directContactIds: toObjectIds(dto.contactIds || [], 'contact'),
       sequenceSteps: [],
-      contacts: [],
+      contacts: makeCampaignContacts(dto.contactIds || []),
     });
 
     await this.campaignGenerationQueue.add(
@@ -240,7 +240,7 @@ export class CampaignsService implements OnModuleInit {
       targetGroupIds: toObjectIds(dto.groupIds || [], 'group'),
       directContactIds: toObjectIds(dto.contactIds || [], 'contact'),
       sequenceSteps,
-      contacts: [],
+      contacts: makeCampaignContacts(dto.contactIds || []),
     });
 
     return this.serializeCampaign(userId, campaign);
@@ -1027,6 +1027,13 @@ function toObjectIds(ids: string[], label: string) {
     }
     return new Types.ObjectId(id);
   });
+}
+
+function makeCampaignContacts(contactIds: string[]) {
+  return toObjectIds(contactIds, 'contact').map((contactId) => ({
+    contactId,
+    status: GenerationStatus.NOT_GENERATED,
+  }));
 }
 
 function serializeCampaignPlain(campaign: any) {
