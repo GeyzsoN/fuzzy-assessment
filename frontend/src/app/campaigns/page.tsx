@@ -52,7 +52,7 @@ const OUTREACH_TEMPLATES = {
     subject: 'Exploring career opportunities together',
     tone: 'Professional',
     prompt: 'Hi {{first_name}},\n\nYour work as {{title}} stood out. I am reaching out because there may be a role that matches the kind of impact you have had at {{company}}.\n\nOpen to a brief conversation?',
-    coverImage: 'https://images.unsplash.com/photo-1521791136368-1a46827d0adb?auto=format&fit=crop&w=600&h=400&q=80',
+    coverImage: 'https://images.unsplash.com/photo-1556761175-b413da4baf72?auto=format&fit=crop&w=600&h=400&q=80',
   },
   partnership: {
     id: 'partnership' as const,
