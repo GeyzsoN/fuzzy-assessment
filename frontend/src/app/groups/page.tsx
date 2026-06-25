@@ -1,10 +1,14 @@
 'use client';
 
-import React, { Suspense, useState, useEffect, useCallback } from 'react';
+import React, { Suspense, useState, useEffect, useCallback, useMemo } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { RefreshCw, Plus, Users, Loader2, AlertCircle, Trash2, UserPlus, FileText } from 'lucide-react';
+import { RefreshCw, Plus, Users, Loader2, AlertCircle, Trash2, UserPlus } from 'lucide-react';
 import Shell from '@/components/shell';
 import { groupsService, contactsService, Group, GroupDetail, Contact } from '@/services/api';
+
+type SortDirection = 'asc' | 'desc';
+type GroupSortKey = 'name' | 'memberCount';
+type MemberSortKey = 'name' | 'email' | 'company';
 
 export default function GroupsPage() {
   return (
@@ -41,8 +45,18 @@ function GroupsPageContent() {
 
   // Add contact to group form
   const [selectedContactId, setSelectedContactId] = useState('');
+  const [contactSearch, setContactSearch] = useState('');
+  const [contactPickerOpen, setContactPickerOpen] = useState(false);
   const [addingContact, setAddingContact] = useState(false);
   const [addContactError, setAddContactError] = useState<string | null>(null);
+  const [groupSort, setGroupSort] = useState<{ key: GroupSortKey; direction: SortDirection }>({
+    key: 'name',
+    direction: 'asc',
+  });
+  const [memberSort, setMemberSort] = useState<{ key: MemberSortKey; direction: SortDirection }>({
+    key: 'name',
+    direction: 'asc',
+  });
 
   const updateGroupUrl = useCallback(
     (groupId: string | null, mode: 'push' | 'replace' = 'push') => {
@@ -182,6 +196,8 @@ function GroupsPageContent() {
     try {
       await groupsService.addContact(selectedGroupId, selectedContactId);
       setSelectedContactId('');
+      setContactSearch('');
+      setContactPickerOpen(false);
       
       // Reload details and groups (to update counts)
       await loadGroupDetails(selectedGroupId);
@@ -192,6 +208,63 @@ function GroupsPageContent() {
     } finally {
       setAddingContact(false);
     }
+  };
+
+  const toggleGroupSort = (key: GroupSortKey) => {
+    setGroupSort((current) => ({
+      key,
+      direction: current.key === key && current.direction === 'asc' ? 'desc' : 'asc',
+    }));
+  };
+
+  const toggleMemberSort = (key: MemberSortKey) => {
+    setMemberSort((current) => ({
+      key,
+      direction: current.key === key && current.direction === 'asc' ? 'desc' : 'asc',
+    }));
+  };
+
+  const sortedGroups = useMemo(() => {
+    return [...groups].sort((a, b) => {
+      const direction = groupSort.direction === 'asc' ? 1 : -1;
+      if (groupSort.key === 'memberCount') {
+        return (a.memberCount - b.memberCount) * direction;
+      }
+      return a.name.localeCompare(b.name) * direction;
+    });
+  }, [groups, groupSort]);
+
+  const availableContacts = useMemo(() => {
+    const memberIds = new Set(selectedGroupDetail?.contactIds || []);
+    const query = contactSearch.trim().toLowerCase();
+
+    return allContacts
+      .filter((contact) => !memberIds.has(contact.id))
+      .filter((contact) => {
+        if (!query) return true;
+        return [contact.name, contact.email, contact.company, contact.title]
+          .filter(Boolean)
+          .some((value) => String(value).toLowerCase().includes(query));
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [allContacts, contactSearch, selectedGroupDetail]);
+
+  const selectedContact = useMemo(
+    () => allContacts.find((contact) => contact.id === selectedContactId) || null,
+    [allContacts, selectedContactId],
+  );
+
+  const sortedMembers = useMemo(() => {
+    const members = selectedGroupDetail?.members || [];
+    return [...members].sort((a, b) => {
+      const direction = memberSort.direction === 'asc' ? 1 : -1;
+      return (a[memberSort.key] || '').localeCompare(b[memberSort.key] || '') * direction;
+    });
+  }, [memberSort, selectedGroupDetail]);
+
+  const sortLabel = (key: string, active: { key: string; direction: SortDirection }) => {
+    if (active.key !== key) return '↕';
+    return active.direction === 'asc' ? '↑' : '↓';
   };
 
   // Remove Member Handler
@@ -311,9 +384,27 @@ function GroupsPageContent() {
             
             {/* Split Left: Groups list / table (2/5 columns) */}
             <div className="md:col-span-2 space-y-4">
-              <span className="block text-xs font-bold uppercase tracking-wider text-slate-400 mb-1">
-                Your Segments
-              </span>
+              <div className="flex items-center justify-between gap-3">
+                <span className="block text-xs font-bold uppercase tracking-wider text-slate-400">
+                  Your Segments
+                </span>
+                <div className="flex gap-1">
+                  <button
+                    type="button"
+                    onClick={() => toggleGroupSort('name')}
+                    className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wide text-slate-500 hover:border-slate-300 hover:text-slate-700"
+                  >
+                    Name {sortLabel('name', groupSort)}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => toggleGroupSort('memberCount')}
+                    className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wide text-slate-500 hover:border-slate-300 hover:text-slate-700"
+                  >
+                    Members {sortLabel('memberCount', groupSort)}
+                  </button>
+                </div>
+              </div>
               
               {loadingGroups ? (
                 <div className="p-12 border border-slate-200 bg-white rounded-2xl flex justify-center items-center shadow-sm">
@@ -325,7 +416,7 @@ function GroupsPageContent() {
                 </div>
               ) : (
                 <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm divide-y divide-slate-150">
-                  {groups.map((group) => {
+                  {sortedGroups.map((group) => {
                     const active = group.id === selectedGroupId;
                     return (
                       <button
@@ -407,22 +498,64 @@ function GroupsPageContent() {
                       </div>
                     )}
 
-                    <form onSubmit={handleAddMember} className="flex gap-2.5">
-                      <select
-                        value={selectedContactId}
-                        onChange={(e) => setSelectedContactId(e.target.value)}
-                        className="flex-1 px-3 py-2 border border-slate-200 bg-slate-50 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all"
-                      >
-                        <option value="">-- Choose a contact --</option>
-                        {allContacts
-                          .filter(c => !selectedGroupDetail.contactIds.includes(c.id))
-                          .map(c => (
-                            <option key={c.id} value={c.id}>
-                              {c.name} ({c.email}) {c.company ? `— ${c.company}` : ''}
-                            </option>
-                          ))
-                        }
-                      </select>
+                    <form onSubmit={handleAddMember} className="flex items-start gap-2.5">
+                      <div className="relative flex-1">
+                        <input
+                          type="text"
+                          value={contactSearch}
+                          onFocus={() => setContactPickerOpen(true)}
+                          onChange={(event) => {
+                            setContactSearch(event.target.value);
+                            setSelectedContactId('');
+                            setContactPickerOpen(true);
+                          }}
+                          placeholder={selectedContact ? '' : 'Search contacts by name, email, or company...'}
+                          className="w-full px-3 py-2 border border-slate-200 bg-slate-50 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all"
+                        />
+                        {selectedContact && !contactSearch && (
+                          <div className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-sm font-semibold text-slate-700">
+                            {selectedContact.name}
+                            <span className="ml-1 font-normal text-slate-400">
+                              {selectedContact.email}
+                            </span>
+                          </div>
+                        )}
+
+                        {contactPickerOpen && (
+                          <div className="absolute z-20 mt-2 max-h-72 w-full overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl">
+                            {availableContacts.length === 0 ? (
+                              <div className="px-3 py-4 text-center text-xs font-semibold text-slate-400">
+                                No available contacts match that search.
+                              </div>
+                            ) : (
+                              <div className="max-h-72 overflow-y-auto py-1">
+                                {availableContacts.slice(0, 40).map((contact) => (
+                                  <button
+                                    key={contact.id}
+                                    type="button"
+                                    onClick={() => {
+                                      setSelectedContactId(contact.id);
+                                      setContactSearch('');
+                                      setContactPickerOpen(false);
+                                    }}
+                                    className={`w-full px-3 py-2.5 text-left transition-colors hover:bg-indigo-50/50 ${
+                                      selectedContactId === contact.id ? 'bg-indigo-50' : 'bg-white'
+                                    }`}
+                                  >
+                                    <div className="text-sm font-bold text-slate-900">
+                                      {contact.name}
+                                    </div>
+                                    <div className="mt-0.5 flex flex-wrap gap-x-2 gap-y-0.5 text-[11px] text-slate-500">
+                                      <span className="font-mono">{contact.email}</span>
+                                      {contact.company && <span>{contact.company}</span>}
+                                    </div>
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
                       <button
                         type="submit"
                         disabled={addingContact || !selectedContactId}
@@ -442,9 +575,14 @@ function GroupsPageContent() {
 
                   {/* Group members table */}
                   <div className="border-t border-slate-200 pt-5">
-                    <span className="block text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">
-                      Current Segment Members
-                    </span>
+                    <div className="mb-3 flex items-center justify-between gap-3">
+                      <span className="block text-xs font-bold uppercase tracking-wider text-slate-400">
+                        Current Segment Members
+                      </span>
+                      <span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">
+                        Sorted by {memberSort.key} {memberSort.direction === 'asc' ? 'ascending' : 'descending'}
+                      </span>
+                    </div>
 
                     {selectedGroupDetail.members.length === 0 ? (
                       <div className="text-center py-10 bg-slate-50 rounded-xl border border-dashed border-slate-200 text-slate-400 text-xs">
@@ -455,14 +593,38 @@ function GroupsPageContent() {
                         <table className="w-full text-left text-xs border-collapse">
                           <thead>
                             <tr className="bg-slate-55 border-b border-slate-200 font-bold uppercase tracking-wider text-slate-400">
-                              <th className="px-4 py-3">Name</th>
-                              <th className="px-4 py-3">Email</th>
-                              <th className="px-4 py-3">Company</th>
+                              <th className="px-4 py-3">
+                                <button
+                                  type="button"
+                                  onClick={() => toggleMemberSort('name')}
+                                  className="inline-flex items-center gap-1 hover:text-slate-700"
+                                >
+                                  Name {sortLabel('name', memberSort)}
+                                </button>
+                              </th>
+                              <th className="px-4 py-3">
+                                <button
+                                  type="button"
+                                  onClick={() => toggleMemberSort('email')}
+                                  className="inline-flex items-center gap-1 hover:text-slate-700"
+                                >
+                                  Email {sortLabel('email', memberSort)}
+                                </button>
+                              </th>
+                              <th className="px-4 py-3">
+                                <button
+                                  type="button"
+                                  onClick={() => toggleMemberSort('company')}
+                                  className="inline-flex items-center gap-1 hover:text-slate-700"
+                                >
+                                  Company {sortLabel('company', memberSort)}
+                                </button>
+                              </th>
                               <th className="px-4 py-3 text-right">Action</th>
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-slate-150 text-slate-700">
-                            {selectedGroupDetail.members.map((member) => (
+                            {sortedMembers.map((member) => (
                               <tr key={member.id} className="hover:bg-indigo-50/10 transition-colors">
                                 <td className="px-4 py-3 font-semibold text-slate-900">
                                   {member.name}
