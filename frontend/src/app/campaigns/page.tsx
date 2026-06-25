@@ -68,6 +68,21 @@ const OUTREACH_TEMPLATES = {
   },
 };
 
+const CORE_PROMPT_TEMPLATES = [
+  {
+    label: 'LinkedIn opener',
+    value: 'Write a concise 2-sentence LinkedIn opener for {{name}}, a {{title}} at {{company}}.',
+  },
+  {
+    label: 'Warm intro',
+    value: 'Write a warm 2-sentence outreach opener for {{name}}, a {{title}} at {{company}}. Mention their role and ask if improving team workflows is relevant.',
+  },
+  {
+    label: 'Direct sales',
+    value: 'Write a direct 2-sentence sales opener for {{name}} at {{company}}. Connect their {{title}} role to a practical operational pain point and end with a low-pressure question.',
+  },
+];
+
 function getDelayFields(minutes: number): { amount: number; unit: 'minutes' | 'hours' | 'days' } {
   if (minutes % 1440 === 0 && minutes >= 1440) {
     return { amount: minutes / 1440, unit: 'days' };
@@ -949,6 +964,25 @@ function CampaignsPageContent() {
               <label className="block text-[11px] font-bold text-slate-400 uppercase tracking-wide mb-1.5">
                 Prompt Template *
               </label>
+              <div className="mb-2 flex flex-wrap gap-2">
+                {CORE_PROMPT_TEMPLATES.map((template) => {
+                  const isSelected = corePromptTemplate === template.value;
+                  return (
+                    <button
+                      key={template.label}
+                      type="button"
+                      onClick={() => setCorePromptTemplate(template.value)}
+                      className={`inline-flex items-center rounded-full border px-3 py-1 text-[11px] font-bold transition-colors ${
+                        isSelected
+                          ? 'border-indigo-600 bg-indigo-50 text-indigo-700'
+                          : 'border-slate-200 bg-white text-slate-500 hover:border-slate-300 hover:text-slate-700'
+                      }`}
+                    >
+                      {template.label}
+                    </button>
+                  );
+                })}
+              </div>
               <textarea
                 required
                 value={corePromptTemplate}
