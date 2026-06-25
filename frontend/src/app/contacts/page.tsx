@@ -448,10 +448,10 @@ function ContactsPageContent() {
               </div>
             ) : (
               <div className="overflow-x-auto">
-                <table className="w-full min-w-[980px] table-fixed text-left border-collapse">
+                <table className="w-full table-fixed text-left border-collapse">
                   <thead>
                     <tr className="bg-slate-55 border-b border-slate-200 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                      <th className="w-[20%] px-6 py-4">
+                      <th className="w-[22%] px-5 py-4">
                         <button
                           type="button"
                           onClick={() => handleSortChange('name')}
@@ -460,7 +460,7 @@ function ContactsPageContent() {
                           Name / Title <ContactsSortIcon activeSort={activeSort} activeDirection={activeDirection} sortKey="name" />
                         </button>
                       </th>
-                      <th className="w-[32%] px-6 py-4">
+                      <th className="w-[31%] px-5 py-4">
                         <button
                           type="button"
                           onClick={() => handleSortChange('email')}
@@ -469,7 +469,7 @@ function ContactsPageContent() {
                           Email <ContactsSortIcon activeSort={activeSort} activeDirection={activeDirection} sortKey="email" />
                         </button>
                       </th>
-                      <th className="w-[26%] px-6 py-4">
+                      <th className="w-[24%] px-5 py-4">
                         <button
                           type="button"
                           onClick={() => handleSortChange('company')}
@@ -478,8 +478,8 @@ function ContactsPageContent() {
                           Company <ContactsSortIcon activeSort={activeSort} activeDirection={activeDirection} sortKey="company" />
                         </button>
                       </th>
-                      <th className="w-[11%] px-6 py-4 text-center">Status</th>
-                      <th className="w-[11%] px-6 py-4 text-right">
+                      <th className="w-[11%] px-5 py-4 text-center">Status</th>
+                      <th className="w-[12%] px-5 py-4 text-right">
                         <button
                           type="button"
                           onClick={() => handleSortChange('createdAt')}
@@ -493,23 +493,23 @@ function ContactsPageContent() {
                   <tbody className="divide-y divide-slate-150 text-slate-700 text-sm">
                     {contacts.map((contact) => (
                       <tr key={contact.id} className="hover:bg-indigo-50/10 transition-colors">
-                        <td className="px-6 py-4">
+                        <td className="px-5 py-4">
                           <div className="font-semibold text-slate-900">{contact.name}</div>
                           <div className="text-xs text-slate-400 font-medium mt-0.5">{contact.title || '—'}</div>
                         </td>
-                        <td className="px-6 py-4 font-mono text-xs text-slate-500 break-all">
+                        <td className="px-5 py-4 font-mono text-xs text-slate-500 break-all">
                           {contact.email}
                         </td>
-                        <td className="px-6 py-4">
+                        <td className="px-5 py-4">
                           {contact.company ? (
-                            <div className="max-w-[260px] rounded-lg border border-slate-200/70 bg-slate-50 px-3 py-1.5 text-xs font-semibold leading-snug text-slate-600 break-words">
+                            <div className="w-full rounded-lg border border-slate-200/70 bg-slate-50 px-2.5 py-1.5 text-xs font-semibold leading-snug text-slate-600 break-words">
                               {contact.company}
                             </div>
                           ) : (
                             <span className="text-slate-300">—</span>
                           )}
                         </td>
-                        <td className="px-6 py-4 text-center">
+                        <td className="px-5 py-4 text-center">
                           {contact.suppressed ? (
                             <span className="inline-flex items-center px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase tracking-wider bg-rose-50 text-rose-700 border border-rose-100">
                               Suppressed
@@ -520,7 +520,7 @@ function ContactsPageContent() {
                             </span>
                           )}
                         </td>
-                        <td className="px-6 py-4 text-right font-mono text-xs text-slate-400">
+                        <td className="px-5 py-4 text-right font-mono text-xs text-slate-400">
                           {new Date(contact.createdAt).toLocaleDateString('en-US', {
                             month: 'short',
                             day: 'numeric',
