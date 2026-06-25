@@ -112,6 +112,7 @@ const CAMPAIGN_STATUS_FILTERS = [
   'completed',
   'failed',
 ] as const;
+const SHOW_LEGACY_CAMPAIGN_FORMS = false;
 type CampaignStatusFilter = (typeof CAMPAIGN_STATUS_FILTERS)[number];
 
 function readPositiveInt(value: string | null, fallback: number) {
@@ -968,6 +969,7 @@ function CampaignsPageContent() {
         </div>
       )}
 
+      {SHOW_LEGACY_CAMPAIGN_FORMS && (
       <section className="mb-10 border-b border-slate-200 pb-10">
         <div className="mb-5">
           <h2 className="text-sm font-sans font-bold text-slate-900 uppercase tracking-wider">
@@ -1146,6 +1148,7 @@ function CampaignsPageContent() {
           </div>
         </form>
       </section>
+      )}
 
       {/* Main Grid: Active Campaigns list on top / left */}
       <div className="space-y-12">
@@ -1330,7 +1333,7 @@ function CampaignsPageContent() {
         </div>
 
         {/* Section 2: Campaign Builder (Visible only when lists exist or as backup) */}
-        {campaigns.length > 0 && (
+        {SHOW_LEGACY_CAMPAIGN_FORMS && campaigns.length > 0 && (
           <div className="border-t border-slate-200 pt-10">
             <div className="mb-6">
               <h2 className="text-lg font-sans font-bold text-slate-900 tracking-tight">
