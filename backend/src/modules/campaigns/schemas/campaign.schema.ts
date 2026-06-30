@@ -105,6 +105,12 @@ export class Campaign {
   generatedAt?: Date;
 
   @Prop()
+  lastAttemptedAt?: Date;
+
+  @Prop()
+  failedAt?: Date;
+
+  @Prop()
   idempotencyScope?: string;
 
   @Prop()

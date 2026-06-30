@@ -2,7 +2,9 @@ import {
   BadRequestException,
   ConflictException,
   HttpException,
+  HttpStatus,
   Injectable,
+  Logger,
   NotFoundException,
   OnModuleInit,
 } from '@nestjs/common';
@@ -38,8 +40,16 @@ import { UpdateCampaignDto } from './dtos/update-campaign.dto';
 import { AttachContactsDto } from './dtos/attach-contacts.dto';
 import { GenerateCampaignDraftDto } from './dtos/generate-campaign-draft.dto';
 import {
+  CAMPAIGN_GENERATION_ATTEMPTS,
   CAMPAIGN_GENERATION_JOB,
   CAMPAIGN_GENERATION_QUEUE,
+  DISPATCH_DUE_SEQUENCE_EMAILS_JOB,
+  DISPATCH_DUE_SEQUENCE_EMAILS_JOB_ID,
+  OUTBOX_DISPATCH_BATCH_SIZE,
+  OUTBOX_DISPATCH_INTERVAL_MS,
+  QUEUE_BACKOFF_DELAY_MS,
+  QUEUE_REMOVE_ON_COMPLETE,
+  SEQUENCE_EMAIL_ATTEMPTS,
   SEQUENCE_EMAIL_JOB,
   SEQUENCE_EMAIL_QUEUE,
 } from './sequence-queue.constants';
@@ -57,6 +67,15 @@ import {
 import { ContactsService } from '../contacts/contacts.service';
 import { GroupsService } from '../groups/groups.service';
 import { LlmService } from '../../shared/llm/llm.service';
+import {
+  LlmQuotaUsage,
+  LlmQuotaUsageDocument,
+} from './schemas/llm-quota-usage.schema';
+import {
+  assertCampaignTransition,
+  assertGenerationTransition,
+  assertOutboxTransition,
+} from './campaign-workflow';
 
 type ResolvedRecipient = {
   contactId: string;
@@ -80,9 +99,13 @@ const GENERATABLE_CONTACT_STATUSES = [
 const IDEMPOTENCY_KEY_MAX_LENGTH = 128;
 const CREATE_CAMPAIGN_IDEMPOTENCY_SCOPE = 'campaign:create';
 const GENERATE_DRAFT_IDEMPOTENCY_SCOPE = 'campaign:generate-draft';
+const DEFAULT_LLM_DAILY_QUOTA_PER_USER = 100;
+const DEFAULT_LLM_QUOTA_WINDOW_MS = 86_400_000;
 
 @Injectable()
 export class CampaignsService implements OnModuleInit {
+  private readonly logger = new Logger(CampaignsService.name);
+
   constructor(
     @InjectModel(Campaign.name)
     private readonly campaignModel: Model<CampaignDocument>,
@@ -94,6 +117,8 @@ export class CampaignsService implements OnModuleInit {
     private readonly campaignTemplateModel: Model<CampaignTemplateDocument>,
     @InjectModel(PromptTemplate.name)
     private readonly promptTemplateModel: Model<PromptTemplateDocument>,
+    @InjectModel(LlmQuotaUsage.name)
+    private readonly llmQuotaUsageModel: Model<LlmQuotaUsageDocument>,
     @InjectQueue(SEQUENCE_EMAIL_QUEUE)
     private readonly sequenceQueue: Queue,
     @InjectQueue(CAMPAIGN_GENERATION_QUEUE)
@@ -105,6 +130,7 @@ export class CampaignsService implements OnModuleInit {
 
   async onModuleInit() {
     await this.seedManagedTemplates();
+    await this.scheduleDueOutboxDispatcher();
   }
 
   async listTemplates(): Promise<any[]> {
@@ -170,6 +196,23 @@ export class CampaignsService implements OnModuleInit {
     }
 
     try {
+      await this.consumeLlmQuota(userId, 'campaign-draft');
+    } catch (error) {
+      await this.campaignModel.updateOne(
+        { _id: campaign._id, userId, status: CampaignStatus.GENERATING },
+        {
+          $set: {
+            status: CampaignStatus.FAILED,
+            generationError: safeErrorMessage(error, 'LLM quota exceeded'),
+            failedAt: new Date(),
+            lastAttemptedAt: new Date(),
+          },
+        },
+      );
+      throw error;
+    }
+
+    try {
       await this.campaignGenerationQueue.add(
         CAMPAIGN_GENERATION_JOB,
         {
@@ -179,11 +222,14 @@ export class CampaignsService implements OnModuleInit {
         },
         {
           jobId: makeBullJobId(CAMPAIGN_GENERATION_JOB, String(campaign._id)),
-          attempts: 2,
-          backoff: { type: 'exponential', delay: 1000 },
-          removeOnComplete: 1000,
+          attempts: CAMPAIGN_GENERATION_ATTEMPTS,
+          backoff: { type: 'exponential', delay: QUEUE_BACKOFF_DELAY_MS },
+          removeOnComplete: QUEUE_REMOVE_ON_COMPLETE,
           removeOnFail: false,
         },
+      );
+      this.logger.log(
+        `Queued campaign draft generation campaignId=${String(campaign._id)} userId=${userId}`,
       );
     } catch (error) {
       await this.campaignModel.updateOne(
@@ -195,8 +241,14 @@ export class CampaignsService implements OnModuleInit {
               error,
               'Campaign draft generation could not be queued',
             ),
+            failedAt: new Date(),
+            lastAttemptedAt: new Date(),
           },
         },
+      );
+      this.logger.error(
+        `Failed to queue campaign draft generation campaignId=${String(campaign._id)} userId=${userId}`,
+        error instanceof Error ? error.stack : undefined,
       );
       throw error;
     }
@@ -219,12 +271,16 @@ export class CampaignsService implements OnModuleInit {
     ) {
       throw new BadRequestException('Campaign is not pending generation');
     }
+    assertCampaignTransition(campaign.status, CampaignStatus.GENERATING);
 
     await this.campaignModel.updateOne(
       { _id: campaign._id, userId: input.userId },
       {
-        $set: { status: CampaignStatus.GENERATING },
-        $unset: { generationError: '' },
+        $set: {
+          status: CampaignStatus.GENERATING,
+          lastAttemptedAt: new Date(),
+        },
+        $unset: { generationError: '', failedAt: '' },
       },
     );
 
@@ -267,20 +323,28 @@ export class CampaignsService implements OnModuleInit {
             sequenceSteps,
             generatedAt: new Date(),
           },
-          $unset: { generationError: '' },
+          $unset: { generationError: '', failedAt: '' },
         },
       );
+      this.logger.log(
+        `Generated campaign draft campaignId=${String(campaign._id)} userId=${input.userId}`,
+      );
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : 'Campaign draft generation failed';
+      const message = safeErrorMessage(error, 'Campaign draft generation failed');
       await this.campaignModel.updateOne(
         { _id: campaign._id, userId: input.userId },
         {
           $set: {
             status: CampaignStatus.FAILED,
             generationError: message,
+            failedAt: new Date(),
+            lastAttemptedAt: new Date(),
           },
         },
+      );
+      this.logger.error(
+        `Campaign draft generation failed campaignId=${String(campaign._id)} userId=${input.userId}`,
+        error instanceof Error ? error.stack : undefined,
       );
       throw error;
     }
@@ -485,6 +549,10 @@ export class CampaignsService implements OnModuleInit {
     if (campaign.status && campaign.status !== CampaignStatus.DRAFT) {
       throw new BadRequestException('Campaign has already been launched');
     }
+    assertCampaignTransition(
+      campaign.status || CampaignStatus.DRAFT,
+      CampaignStatus.LAUNCHING,
+    );
 
     const sequenceSteps = normalizeSequenceSteps(
       campaign.sequenceSteps,
@@ -510,8 +578,10 @@ export class CampaignsService implements OnModuleInit {
         $set: {
           status: CampaignStatus.LAUNCHING,
           launchedAt: new Date(),
+          lastAttemptedAt: new Date(),
           sequenceSteps,
         },
+        $unset: { failedAt: '', generationError: '' },
       },
       { new: true },
     );
@@ -530,8 +600,11 @@ export class CampaignsService implements OnModuleInit {
         { _id: claimed._id, userId, status: CampaignStatus.LAUNCHING },
         {
           $set: { status: CampaignStatus.RUNNING },
-          $unset: { generationError: '' },
+          $unset: { generationError: '', failedAt: '' },
         },
+      );
+      this.logger.log(
+        `Launched campaign campaignId=${String(claimed._id)} userId=${userId}`,
       );
 
       const updated = await this.requireCampaign(userId, campaignId);
@@ -543,8 +616,14 @@ export class CampaignsService implements OnModuleInit {
           $set: {
             status: CampaignStatus.FAILED,
             generationError: safeErrorMessage(error, 'Campaign launch failed'),
+            failedAt: new Date(),
+            lastAttemptedAt: new Date(),
           },
         },
+      );
+      this.logger.error(
+        `Campaign launch failed campaignId=${String(claimed._id)} userId=${userId}`,
+        error instanceof Error ? error.stack : undefined,
       );
       throw error;
     }
@@ -561,6 +640,7 @@ export class CampaignsService implements OnModuleInit {
     ) {
       throw new BadRequestException('Only draft campaigns can generate a sequence');
     }
+    assertCampaignTransition(campaign.status, CampaignStatus.GENERATING);
 
     const campaignTemplate = await this.findDefaultCampaignTemplate();
     const goal =
@@ -609,8 +689,9 @@ export class CampaignsService implements OnModuleInit {
           targetGroupIds: toObjectIds(groupIds, 'group'),
           directContactIds: toObjectIds(contactIds, 'contact'),
           sequenceSteps: [],
+          lastAttemptedAt: new Date(),
         },
-        $unset: { generationError: '' },
+        $unset: { generationError: '', failedAt: '' },
       },
       { new: true },
     );
@@ -623,16 +704,36 @@ export class CampaignsService implements OnModuleInit {
     }
 
     try {
+      await this.consumeLlmQuota(userId, 'campaign-sequence');
+    } catch (error) {
+      await this.campaignModel.updateOne(
+        { _id: claimed._id, userId, status: CampaignStatus.GENERATING },
+        {
+          $set: {
+            status: CampaignStatus.FAILED,
+            generationError: safeErrorMessage(error, 'LLM quota exceeded'),
+            failedAt: new Date(),
+            lastAttemptedAt: new Date(),
+          },
+        },
+      );
+      throw error;
+    }
+
+    try {
       await this.campaignGenerationQueue.add(
         CAMPAIGN_GENERATION_JOB,
         { userId, campaignId: String(claimed._id), dto },
         {
           jobId: makeBullJobId(CAMPAIGN_GENERATION_JOB, String(claimed._id)),
-          attempts: 2,
-          backoff: { type: 'exponential', delay: 1000 },
-          removeOnComplete: 1000,
+          attempts: CAMPAIGN_GENERATION_ATTEMPTS,
+          backoff: { type: 'exponential', delay: QUEUE_BACKOFF_DELAY_MS },
+          removeOnComplete: QUEUE_REMOVE_ON_COMPLETE,
           removeOnFail: false,
         },
+      );
+      this.logger.log(
+        `Queued campaign sequence generation campaignId=${String(claimed._id)} userId=${userId}`,
       );
     } catch (error) {
       await this.campaignModel.updateOne(
@@ -644,8 +745,14 @@ export class CampaignsService implements OnModuleInit {
               error,
               'Campaign sequence generation could not be queued',
             ),
+            failedAt: new Date(),
+            lastAttemptedAt: new Date(),
           },
         },
+      );
+      this.logger.error(
+        `Failed to queue campaign sequence generation campaignId=${String(claimed._id)} userId=${userId}`,
+        error instanceof Error ? error.stack : undefined,
       );
       throw error;
     }
@@ -747,6 +854,7 @@ export class CampaignsService implements OnModuleInit {
     if (!entry) {
       throw new BadRequestException('Contact is not attached to this campaign');
     }
+    assertGenerationTransition(entry.status, GenerationStatus.PENDING);
 
     const generationAttemptId = new Types.ObjectId().toHexString();
     const staleGenerationLockedBefore = new Date(
@@ -783,14 +891,21 @@ export class CampaignsService implements OnModuleInit {
       { new: true },
     );
     if (!claimed) {
+      this.logger.log(
+        `Skipped direct generation claim campaignId=${String(campaign._id)} contactId=${contactId} userId=${userId}`,
+      );
       return this.readCampaignContactResult(
         userId,
         campaign._id,
         outboxContactId,
       );
     }
+    this.logger.log(
+      `Claimed direct generation campaignId=${String(campaign._id)} contactId=${contactId} userId=${userId}`,
+    );
 
     try {
+      await this.consumeLlmQuota(userId, 'contact-message');
       const template =
         campaign.promptTemplate || campaign.sequenceSteps?.[0]?.promptTemplate;
       if (!template) {
@@ -865,6 +980,9 @@ export class CampaignsService implements OnModuleInit {
           },
         },
       );
+      if (isTooManyRequestsError(error)) {
+        throw error;
+      }
       if (failed.matchedCount === 0) {
         return this.readCampaignContactResult(
           userId,
@@ -886,6 +1004,7 @@ export class CampaignsService implements OnModuleInit {
     if (!current || current.status === OutboxStatus.SENT) {
       return;
     }
+    assertOutboxTransition(current.status, OutboxStatus.PROCESSING);
 
     const staleLockedBefore = new Date(Date.now() - OUTBOX_PROCESSING_STALE_MS);
     const claimed = await this.outboxModel.findOneAndUpdate(
@@ -903,14 +1022,20 @@ export class CampaignsService implements OnModuleInit {
         $set: {
           status: OutboxStatus.PROCESSING,
           lockedAt: new Date(),
-          error: undefined,
+          lastAttemptedAt: new Date(),
         },
+        $unset: { error: '', failedAt: '' },
         $inc: { attempts: 1 },
       },
       { new: true },
     );
     if (!claimed) {
       return;
+    }
+    if (current.status === OutboxStatus.PROCESSING) {
+      this.logger.warn(
+        `Reclaimed stale outbox lock outboxId=${outboxId} userId=${current.userId}`,
+      );
     }
 
     try {
@@ -962,8 +1087,11 @@ export class CampaignsService implements OnModuleInit {
             body,
             sentAt: new Date(),
           },
-          $unset: { error: '', lockedAt: '' },
+          $unset: { error: '', lockedAt: '', failedAt: '' },
         },
+      );
+      this.logger.log(
+        `Processed outbox message outboxId=${String(claimed._id)} campaignId=${String(campaign._id)} userId=${claimed.userId}`,
       );
       await this.markCampaignCompleteIfDone(claimed.userId, String(campaign._id));
     } catch (error) {
@@ -975,12 +1103,53 @@ export class CampaignsService implements OnModuleInit {
           $set: {
             status: OutboxStatus.FAILED,
             error: message,
+            failedAt: new Date(),
+            lastAttemptedAt: new Date(),
           },
           $unset: { lockedAt: '' },
         },
       );
+      this.logger.error(
+        `Outbox processing failed outboxId=${String(claimed._id)} userId=${claimed.userId}`,
+        error instanceof Error ? error.stack : undefined,
+      );
       throw error;
     }
+  }
+
+  async dispatchDueOutboxMessages(
+    now = new Date(),
+  ): Promise<{ enqueued: number }> {
+    const rows = await this.outboxModel
+      .find({
+        status: OutboxStatus.QUEUED,
+        $or: [
+          { scheduledFor: { $lte: now } },
+          { scheduledFor: { $exists: false } },
+        ],
+      })
+      .sort({ scheduledFor: 1, _id: 1 })
+      .limit(OUTBOX_DISPATCH_BATCH_SIZE)
+      .lean()
+      .exec();
+
+    let enqueued = 0;
+    for (const row of rows as any[]) {
+      await this.enqueueOutboxMessage(
+        String(row.campaignId),
+        row.stepId,
+        String(row.contactId),
+        String(row._id),
+        0,
+      );
+      enqueued += 1;
+    }
+
+    if (enqueued > 0) {
+      this.logger.log(`Dispatched due outbox messages count=${enqueued}`);
+    }
+
+    return { enqueued };
   }
 
   private async readCampaignContactResult(
@@ -1036,10 +1205,16 @@ export class CampaignsService implements OnModuleInit {
     }
 
     if (existing.idempotencyFingerprint !== idempotency.fingerprint) {
+      this.logger.warn(
+        `Idempotency conflict userId=${userId} scope=${idempotency.scope}`,
+      );
       throw new ConflictException(
         'Idempotency-Key was already used with a different request payload',
       );
     }
+    this.logger.log(
+      `Idempotency hit userId=${userId} scope=${idempotency.scope} campaignId=${String(existing._id)}`,
+    );
     return existing;
   }
 
@@ -1052,6 +1227,69 @@ export class CampaignsService implements OnModuleInit {
       return undefined;
     }
     return this.findIdempotentCampaign(userId, idempotency);
+  }
+
+  private async consumeLlmQuota(userId: string, reason: string) {
+    const limit = readPositiveEnvInt(
+      'LLM_DAILY_QUOTA_PER_USER',
+      DEFAULT_LLM_DAILY_QUOTA_PER_USER,
+    );
+    if (limit <= 0) {
+      return;
+    }
+
+    const windowMs = readPositiveEnvInt(
+      'LLM_QUOTA_WINDOW_MS',
+      DEFAULT_LLM_QUOTA_WINDOW_MS,
+    );
+    const now = new Date();
+    const windowStart = new Date(
+      Math.floor(now.getTime() / windowMs) * windowMs,
+    );
+    const windowEnd = new Date(windowStart.getTime() + windowMs);
+
+    await this.llmQuotaUsageModel.updateOne(
+      { userId, windowStart },
+      {
+        $setOnInsert: {
+          userId,
+          windowStart,
+          windowEnd,
+          count: 0,
+        },
+      },
+      { upsert: true },
+    );
+
+    const usage = await this.llmQuotaUsageModel.findOneAndUpdate(
+      {
+        userId,
+        windowStart,
+        count: { $lt: limit },
+      },
+      {
+        $inc: { count: 1 },
+        $set: {
+          windowEnd,
+          lastUsedAt: now,
+        },
+      },
+      { new: true },
+    );
+
+    if (!usage) {
+      this.logger.warn(
+        `LLM quota exceeded userId=${userId} reason=${reason} limit=${limit}`,
+      );
+      throw new HttpException(
+        'Daily LLM quota exceeded',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    this.logger.log(
+      `Consumed LLM quota userId=${userId} reason=${reason} count=${usage.count}/${limit}`,
+    );
   }
 
   private async requireCampaign(userId: string, campaignId: string) {
@@ -1117,6 +1355,26 @@ export class CampaignsService implements OnModuleInit {
         ),
       ),
     ]);
+  }
+
+  private async scheduleDueOutboxDispatcher() {
+    try {
+      await this.sequenceQueue.add(
+        DISPATCH_DUE_SEQUENCE_EMAILS_JOB,
+        {},
+        {
+          jobId: DISPATCH_DUE_SEQUENCE_EMAILS_JOB_ID,
+          repeat: { every: OUTBOX_DISPATCH_INTERVAL_MS },
+          removeOnComplete: QUEUE_REMOVE_ON_COMPLETE,
+          removeOnFail: false,
+        },
+      );
+    } catch (error) {
+      this.logger.error(
+        'Failed to schedule due outbox dispatcher',
+        error instanceof Error ? error.stack : undefined,
+      );
+    }
   }
 
   private async validateTargets(
@@ -1277,28 +1535,52 @@ export class CampaignsService implements OnModuleInit {
     );
 
     if (outbox.status !== OutboxStatus.SENT) {
-      await this.sequenceQueue.add(
-        SEQUENCE_EMAIL_JOB,
-        { outboxId: String(outbox._id) },
-        {
-          jobId: makeBullJobId(campaignId, step.stepId, recipient.contactId),
-          delay: delayMs,
-          attempts: 3,
-          backoff: { type: 'exponential', delay: 1000 },
-          removeOnComplete: 1000,
-          removeOnFail: false,
-        },
-      );
+      try {
+        await this.enqueueOutboxMessage(
+          campaignId,
+          step.stepId,
+          recipient.contactId,
+          String(outbox._id),
+          delayMs,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Outbox queue add failed; dispatcher will retry outboxId=${String(outbox._id)} campaignId=${campaignId}`,
+        );
+      }
     }
 
     return outbox;
+  }
+
+  private async enqueueOutboxMessage(
+    campaignId: string,
+    stepId: string,
+    contactId: string,
+    outboxId: string,
+    delayMs: number,
+  ) {
+    await this.sequenceQueue.add(
+      SEQUENCE_EMAIL_JOB,
+      { outboxId },
+      {
+        jobId: makeBullJobId(campaignId, stepId, contactId),
+        delay: Math.max(0, delayMs),
+        attempts: SEQUENCE_EMAIL_ATTEMPTS,
+        backoff: { type: 'exponential', delay: QUEUE_BACKOFF_DELAY_MS },
+        removeOnComplete: QUEUE_REMOVE_ON_COMPLETE,
+        removeOnFail: false,
+      },
+    );
   }
 
   private async markCampaignCompleteIfDone(userId: string, campaignId: string) {
     const unfinished = await this.outboxModel.countDocuments({
       userId,
       campaignId: new Types.ObjectId(campaignId),
-      status: { $in: [OutboxStatus.QUEUED, OutboxStatus.PROCESSING] },
+      status: {
+        $in: [OutboxStatus.QUEUED, OutboxStatus.PROCESSING, OutboxStatus.FAILED],
+      },
     });
     if (unfinished > 0) {
       return;
@@ -1501,6 +1783,13 @@ function safeErrorMessage(error: unknown, fallback: string) {
   return fallback;
 }
 
+function isTooManyRequestsError(error: unknown) {
+  return (
+    error instanceof HttpException &&
+    error.getStatus() === HttpStatus.TOO_MANY_REQUESTS
+  );
+}
+
 function normalizeIdempotencyKey(value?: string) {
   const key = (value || '').trim();
   if (!key) {
@@ -1533,6 +1822,11 @@ function isDuplicateKeyError(error: unknown) {
     'code' in error &&
     (error as { code?: number }).code === 11000
   );
+}
+
+function readPositiveEnvInt(name: string, fallback: number) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
 }
 
 function inferRequestedStepCount(value: string): number | undefined {

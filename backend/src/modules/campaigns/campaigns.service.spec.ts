@@ -2,6 +2,7 @@ import { Types } from 'mongoose';
 import { CampaignsService } from './campaigns.service';
 import { CampaignStatus, GenerationStatus } from './schemas/campaign.schema';
 import { OutboxStatus } from './schemas/outbox-message.schema';
+import { SEQUENCE_EMAIL_JOB } from './sequence-queue.constants';
 
 describe('CampaignsService workflow hardening', () => {
   const userId = 'user-1';
@@ -11,6 +12,7 @@ describe('CampaignsService workflow hardening', () => {
   let outboxModel: any;
   let campaignTemplateModel: any;
   let promptTemplateModel: any;
+  let llmQuotaUsageModel: any;
   let sequenceQueue: any;
   let campaignGenerationQueue: any;
   let contactsService: any;
@@ -49,6 +51,10 @@ describe('CampaignsService workflow hardening', () => {
       findOne: jest.fn(),
       updateOne: jest.fn(),
     };
+    llmQuotaUsageModel = {
+      updateOne: jest.fn().mockResolvedValue({}),
+      findOneAndUpdate: jest.fn().mockResolvedValue({ count: 1 }),
+    };
     sequenceQueue = {
       add: jest.fn(),
       remove: jest.fn(),
@@ -72,6 +78,7 @@ describe('CampaignsService workflow hardening', () => {
       outboxModel,
       campaignTemplateModel,
       promptTemplateModel,
+      llmQuotaUsageModel,
       sequenceQueue,
       campaignGenerationQueue,
       contactsService,
@@ -142,6 +149,16 @@ describe('CampaignsService workflow hardening', () => {
         'contacts.$.generationLockedAt': '',
       },
     });
+    expect(llmQuotaUsageModel.findOneAndUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId,
+        count: { $lt: 100 },
+      }),
+      expect.objectContaining({
+        $inc: { count: 1 },
+      }),
+      { new: true },
+    );
     expect(
       campaignModel.findOneAndUpdate.mock.invocationCallOrder[0],
     ).toBeLessThan(llm.complete.mock.invocationCallOrder[0]);
@@ -231,6 +248,46 @@ describe('CampaignsService workflow hardening', () => {
           'contacts.$.generationAttemptId': '',
           'contacts.$.generationLockedAt': '',
         },
+      }),
+    );
+  });
+
+  it('throws when direct generation exceeds the LLM quota', async () => {
+    const campaignId = new Types.ObjectId();
+    const contactId = new Types.ObjectId();
+    const campaign = makeCampaign(campaignId, contactId);
+    jest.spyOn(service as any, 'requireCampaign').mockResolvedValue(campaign);
+    contactsService.findOwnedByIds.mockResolvedValue([
+      {
+        _id: contactId,
+        name: 'Ada Lovelace',
+        email: 'ada@example.com',
+        company: 'Acme',
+      },
+    ]);
+    campaignModel.findOneAndUpdate.mockResolvedValueOnce({ _id: campaignId });
+    llmQuotaUsageModel.findOneAndUpdate.mockResolvedValueOnce(null);
+
+    await expect(
+      service.generateForContact(userId, String(campaignId), String(contactId)),
+    ).rejects.toThrow('Daily LLM quota exceeded');
+
+    expect(llm.complete).not.toHaveBeenCalled();
+    expect(campaignModel.updateOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contacts: {
+          $elemMatch: expect.objectContaining({
+            contactId,
+            status: GenerationStatus.PENDING,
+            generationAttemptId: expect.any(String),
+          }),
+        },
+      }),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          'contacts.$.status': GenerationStatus.FAILED,
+          'contacts.$.error': 'Daily LLM quota exceeded',
+        }),
       }),
     );
   });
@@ -379,6 +436,7 @@ describe('CampaignsService workflow hardening', () => {
     expect(result).toEqual({ _id: String(campaignId) });
     expect(campaignModel.create).not.toHaveBeenCalled();
     expect(campaignGenerationQueue.add).not.toHaveBeenCalled();
+    expect(llmQuotaUsageModel.findOneAndUpdate).not.toHaveBeenCalled();
   });
 
   it('rejects reused idempotency keys with different payloads', async () => {
@@ -536,12 +594,14 @@ describe('CampaignsService workflow hardening', () => {
 
     expect(campaignModel.updateOne).toHaveBeenCalledWith(
       { _id: campaignId, userId, status: CampaignStatus.GENERATING },
-      {
-        $set: {
+      expect.objectContaining({
+        $set: expect.objectContaining({
           status: CampaignStatus.FAILED,
           generationError: 'Campaign sequence generation could not be queued',
-        },
-      },
+          failedAt: expect.any(Date),
+          lastAttemptedAt: expect.any(Date),
+        }),
+      }),
     );
   });
 
@@ -609,12 +669,65 @@ describe('CampaignsService workflow hardening', () => {
 
     expect(campaignModel.updateOne).toHaveBeenCalledWith(
       { _id: campaignId, userId, status: CampaignStatus.GENERATING },
-      {
-        $set: {
+      expect.objectContaining({
+        $set: expect.objectContaining({
           status: CampaignStatus.FAILED,
           generationError: 'Campaign draft generation could not be queued',
-        },
-      },
+          failedAt: expect.any(Date),
+          lastAttemptedAt: expect.any(Date),
+        }),
+      }),
+    );
+  });
+
+  it('marks draft generation failed and does not enqueue when quota is exceeded', async () => {
+    const campaignId = new Types.ObjectId();
+    const campaign = makeCampaign(campaignId, new Types.ObjectId(), []);
+    campaignTemplateModel.findOne.mockReturnValueOnce(
+      query({
+        _id: new Types.ObjectId(),
+        key: 'cold-intro',
+        name: 'Cold intro',
+        defaultMaxSteps: 3,
+        promptTemplateKey: 'sequence-draft-v1',
+        steps: [],
+      }),
+    );
+    promptTemplateModel.findOne.mockReturnValueOnce(
+      query({
+        key: 'sequence-draft-v1',
+        name: 'Sequence draft',
+        systemPrompt: 'System',
+        userPrompt: 'User',
+      }),
+    );
+    campaignModel.create.mockResolvedValue(campaign);
+    llmQuotaUsageModel.findOneAndUpdate.mockResolvedValueOnce(null);
+
+    await expect(
+      service.generateDraft(userId, {
+        name: 'Generated sequence',
+        goal: 'Book calls',
+        audienceDescription: 'Founders',
+        templateId: 'cold-intro',
+        tone: 'direct',
+        maxSteps: 3,
+        groupIds: [],
+        contactIds: [],
+      }),
+    ).rejects.toThrow('Daily LLM quota exceeded');
+
+    expect(campaignGenerationQueue.add).not.toHaveBeenCalled();
+    expect(campaignModel.updateOne).toHaveBeenCalledWith(
+      { _id: campaignId, userId, status: CampaignStatus.GENERATING },
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          status: CampaignStatus.FAILED,
+          generationError: 'Daily LLM quota exceeded',
+          failedAt: expect.any(Date),
+          lastAttemptedAt: expect.any(Date),
+        }),
+      }),
     );
   });
 
@@ -647,12 +760,14 @@ describe('CampaignsService workflow hardening', () => {
 
     expect(campaignModel.updateOne).toHaveBeenCalledWith(
       { _id: campaignId, userId, status: CampaignStatus.LAUNCHING },
-      {
-        $set: {
+      expect.objectContaining({
+        $set: expect.objectContaining({
           status: CampaignStatus.FAILED,
           generationError: 'Campaign launch failed',
-        },
-      },
+          failedAt: expect.any(Date),
+          lastAttemptedAt: expect.any(Date),
+        }),
+      }),
     );
   });
 
@@ -689,6 +804,39 @@ describe('CampaignsService workflow hardening', () => {
     );
   });
 
+  it('does not complete a campaign while failed outbox rows remain', async () => {
+    const campaignId = new Types.ObjectId();
+    const contactId = new Types.ObjectId();
+    const outboxId = new Types.ObjectId();
+    const claimed = makeOutbox(outboxId, campaignId, contactId, new Date());
+    outboxModel.findById.mockReturnValueOnce(query(claimed));
+    outboxModel.findOneAndUpdate.mockResolvedValueOnce(claimed);
+    outboxModel.countDocuments.mockResolvedValueOnce(1);
+    jest.spyOn(service as any, 'requireCampaign').mockResolvedValue(
+      makeCampaign(campaignId, contactId),
+    );
+
+    await service.processOutboxMessage(String(outboxId));
+
+    expect(outboxModel.countDocuments).toHaveBeenCalledWith({
+      userId,
+      campaignId,
+      status: {
+        $in: [OutboxStatus.QUEUED, OutboxStatus.PROCESSING, OutboxStatus.FAILED],
+      },
+    });
+    expect(campaignModel.updateOne).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId,
+        _id: String(campaignId),
+        status: CampaignStatus.RUNNING,
+      }),
+      expect.objectContaining({
+        $set: expect.objectContaining({ status: CampaignStatus.COMPLETED }),
+      }),
+    );
+  });
+
   it('does not process fresh processing outbox rows', async () => {
     const campaignId = new Types.ObjectId();
     const contactId = new Types.ObjectId();
@@ -703,6 +851,99 @@ describe('CampaignsService workflow hardening', () => {
 
     expect(requireCampaign).not.toHaveBeenCalled();
     expect(outboxModel.updateOne).not.toHaveBeenCalled();
+  });
+
+  it('marks failed outbox rows with inspectable failure metadata', async () => {
+    const campaignId = new Types.ObjectId();
+    const contactId = new Types.ObjectId();
+    const outboxId = new Types.ObjectId();
+    const current = {
+      ...makeOutbox(outboxId, campaignId, contactId, new Date()),
+      status: OutboxStatus.QUEUED,
+    };
+    const campaign = makeCampaign(campaignId, contactId);
+    campaign.sequenceSteps = [
+      {
+        stepId: 'other-step',
+        order: 1,
+        delayMinutes: 0,
+        subjectTemplate: 'Different step for {{company}}',
+        promptTemplate: 'Different body for {{company}}',
+      },
+    ];
+    outboxModel.findById.mockReturnValueOnce(query(current));
+    outboxModel.findOneAndUpdate.mockResolvedValueOnce(current);
+    jest.spyOn(service as any, 'requireCampaign').mockResolvedValue(campaign);
+
+    await expect(service.processOutboxMessage(String(outboxId))).rejects.toThrow(
+      'Sequence step no longer exists',
+    );
+
+    expect(outboxModel.updateOne).toHaveBeenCalledWith(
+      { _id: outboxId },
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          status: OutboxStatus.FAILED,
+          error: 'Sequence step no longer exists',
+          failedAt: expect.any(Date),
+          lastAttemptedAt: expect.any(Date),
+        }),
+        $unset: { lockedAt: '' },
+      }),
+    );
+  });
+
+  it('dispatches due queued outbox rows with deterministic queue job IDs', async () => {
+    const now = new Date('2026-07-01T00:00:00.000Z');
+    const campaignId = new Types.ObjectId();
+    const contactId = new Types.ObjectId();
+    const outboxId = new Types.ObjectId();
+    outboxModel.find.mockReturnValueOnce(
+      query([
+        {
+          _id: outboxId,
+          campaignId,
+          contactId,
+          stepId: 'step-1',
+          status: OutboxStatus.QUEUED,
+          scheduledFor: new Date(now.getTime() - 1000),
+        },
+      ]),
+    );
+    sequenceQueue.add.mockResolvedValueOnce(undefined);
+
+    const result = await service.dispatchDueOutboxMessages(now);
+
+    expect(result).toEqual({ enqueued: 1 });
+    expect(outboxModel.find).toHaveBeenCalledWith({
+      status: OutboxStatus.QUEUED,
+      $or: [
+        { scheduledFor: { $lte: now } },
+        { scheduledFor: { $exists: false } },
+      ],
+    });
+    expect(sequenceQueue.add).toHaveBeenCalledWith(
+      SEQUENCE_EMAIL_JOB,
+      { outboxId: String(outboxId) },
+      expect.objectContaining({
+        jobId: `${String(campaignId)}__step-1__${String(contactId)}`,
+        delay: 0,
+        removeOnFail: false,
+      }),
+    );
+  });
+
+  it('does not dispatch non-queued outbox rows', async () => {
+    const now = new Date('2026-07-01T00:00:00.000Z');
+    outboxModel.find.mockReturnValueOnce(query([]));
+
+    const result = await service.dispatchDueOutboxMessages(now);
+
+    expect(result).toEqual({ enqueued: 0 });
+    expect(outboxModel.find.mock.calls[0][0]).toMatchObject({
+      status: OutboxStatus.QUEUED,
+    });
+    expect(sequenceQueue.add).not.toHaveBeenCalled();
   });
 
   it('keeps safe validation errors for direct generation failures', async () => {
@@ -733,6 +974,7 @@ describe('CampaignsService workflow hardening', () => {
 function query<T>(value: T) {
   return {
     sort: jest.fn().mockReturnThis(),
+    limit: jest.fn().mockReturnThis(),
     select: jest.fn().mockReturnThis(),
     lean: jest.fn().mockReturnThis(),
     exec: jest.fn().mockResolvedValue(value),

@@ -1,4 +1,5 @@
-import { Processor, WorkerHost } from '@nestjs/bullmq';
+import { Logger } from '@nestjs/common';
+import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
 import { CampaignsService } from './campaigns.service';
 import { GenerateCampaignDraftDto } from './dtos/generate-campaign-draft.dto';
@@ -9,6 +10,8 @@ import {
 
 @Processor(CAMPAIGN_GENERATION_QUEUE, { concurrency: 2 })
 export class CampaignGenerationProcessor extends WorkerHost {
+  private readonly logger = new Logger(CampaignGenerationProcessor.name);
+
   constructor(private readonly campaignsService: CampaignsService) {
     super();
   }
@@ -25,5 +28,13 @@ export class CampaignGenerationProcessor extends WorkerHost {
     }
 
     await this.campaignsService.processCampaignDraftGeneration(job.data);
+  }
+
+  @OnWorkerEvent('failed')
+  onFailed(job: Job | undefined, error: Error) {
+    this.logger.error(
+      `Campaign generation job failed jobId=${job?.id || 'unknown'} name=${job?.name || 'unknown'} attemptsMade=${job?.attemptsMade ?? 0}`,
+      error.stack,
+    );
   }
 }

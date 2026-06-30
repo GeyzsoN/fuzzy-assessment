@@ -53,6 +53,12 @@ export class OutboxMessage {
   @Prop()
   sentAt?: Date;
 
+  @Prop()
+  lastAttemptedAt?: Date;
+
+  @Prop()
+  failedAt?: Date;
+
   @Prop({ default: 0 })
   attempts: number;
 

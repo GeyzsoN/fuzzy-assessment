@@ -16,6 +16,10 @@ import {
   PromptTemplate,
   PromptTemplateSchema,
 } from './schemas/campaign-template.schema';
+import {
+  LlmQuotaUsage,
+  LlmQuotaUsageSchema,
+} from './schemas/llm-quota-usage.schema';
 import { CampaignsService } from './campaigns.service';
 import { CampaignsController } from './campaigns.controller';
 import { CampaignTemplatesController } from './campaign-templates.controller';
@@ -37,6 +41,7 @@ import { LlmModule } from '../../shared/llm/llm.module';
       { name: OutboxMessage.name, schema: OutboxMessageSchema },
       { name: CampaignTemplate.name, schema: CampaignTemplateSchema },
       { name: PromptTemplate.name, schema: PromptTemplateSchema },
+      { name: LlmQuotaUsage.name, schema: LlmQuotaUsageSchema },
     ]),
     BullModule.registerQueue(
       { name: SEQUENCE_EMAIL_QUEUE },
