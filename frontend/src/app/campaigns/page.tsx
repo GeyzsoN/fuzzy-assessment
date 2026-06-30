@@ -1,6 +1,6 @@
 'use client';
 
-import React, { Suspense, useState, useEffect, useCallback, useMemo } from 'react';
+import React, { Suspense, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import Link from 'next/link';
 import Image from 'next/image';
 import { useRouter, useSearchParams } from 'next/navigation';
@@ -135,6 +135,17 @@ function readWizardStep(value: string | null) {
   return Math.min(5, Math.max(1, readPositiveInt(value, 1)));
 }
 
+function createIdempotencyKey() {
+  return globalThis.crypto?.randomUUID?.() || `idem-${Date.now()}-${Math.random()}`;
+}
+
+function getInFlightIdempotencyKey(ref: React.MutableRefObject<string | null>) {
+  if (!ref.current) {
+    ref.current = createIdempotencyKey();
+  }
+  return ref.current;
+}
+
 function matchesSearch(query: string, values: Array<string | number | undefined | null>) {
   const normalized = query.trim().toLowerCase();
   if (!normalized) return true;
@@ -233,6 +244,9 @@ function CampaignsPageContent() {
   const [wizardError, setWizardError] = useState<string | null>(null);
   const [builderGroupSearch, setBuilderGroupSearch] = useState('');
   const [builderContactSearch, setBuilderContactSearch] = useState('');
+  const wizardSubmitIdempotencyKeyRef = useRef<string | null>(null);
+  const coreSubmitIdempotencyKeyRef = useRef<string | null>(null);
+  const legacySubmitIdempotencyKeyRef = useRef<string | null>(null);
 
   const updateCampaignsUrl = useCallback(
     (
@@ -624,6 +638,9 @@ function CampaignsPageContent() {
       }
 
       let camp: Campaign;
+      const idempotencyKey = getInFlightIdempotencyKey(
+        wizardSubmitIdempotencyKeyRef,
+      );
       if (wizardMode === 'auto') {
         const backendTemplate = getBackendTemplateForOutreach(wizardOutreachType);
         if (!backendTemplate) {
@@ -645,6 +662,8 @@ function CampaignsPageContent() {
           maxSteps: Math.min(4, Math.max(1, wizardStepsCount)),
           targetGroupIds: wizardSelectedGroupIds,
           targetContactIds: finalContactIds,
+        }, {
+          idempotencyKey,
         });
       } else {
         camp = await campaignsService.create({
@@ -652,6 +671,8 @@ function CampaignsPageContent() {
           targetGroupIds: wizardSelectedGroupIds,
           targetContactIds: finalContactIds,
           sequenceSteps: wizardSteps.slice(0, 4),
+        }, {
+          idempotencyKey,
         });
       }
 
@@ -669,6 +690,7 @@ function CampaignsPageContent() {
     } catch (err: any) {
       setWizardError(err.message || 'Failed to generate campaign sequence.');
     } finally {
+      wizardSubmitIdempotencyKeyRef.current = null;
       setWizardGenerating(false);
     }
   };
@@ -708,10 +730,15 @@ function CampaignsPageContent() {
 
     setCoreCreating(true);
     try {
+      const idempotencyKey = getInFlightIdempotencyKey(
+        coreSubmitIdempotencyKeyRef,
+      );
       const campaign = await campaignsService.create({
         name: coreName.trim(),
         promptTemplate: corePromptTemplate.trim(),
         targetGroupIds: coreGroupIds,
+      }, {
+        idempotencyKey,
       });
       if (coreContactIds.length) {
         await campaignsService.attachContacts(campaign.id, coreContactIds);
@@ -730,6 +757,7 @@ function CampaignsPageContent() {
     } catch (err: any) {
       setCoreError(err.message || 'Failed to create campaign.');
     } finally {
+      coreSubmitIdempotencyKeyRef.current = null;
       setCoreCreating(false);
     }
   };
@@ -754,11 +782,16 @@ function CampaignsPageContent() {
 
     setCreating(true);
     try {
+      const idempotencyKey = getInFlightIdempotencyKey(
+        legacySubmitIdempotencyKeyRef,
+      );
       await campaignsService.create({
         name: campaignName.trim(),
         targetGroupIds: selectedGroupIds,
         targetContactIds: selectedContactIds,
         sequenceSteps,
+      }, {
+        idempotencyKey,
       });
 
       setCampaignName('');
@@ -779,6 +812,7 @@ function CampaignsPageContent() {
     } catch (err: any) {
       setCreateError(err.message || 'Failed to create campaign draft.');
     } finally {
+      legacySubmitIdempotencyKeyRef.current = null;
       setCreating(false);
     }
   };

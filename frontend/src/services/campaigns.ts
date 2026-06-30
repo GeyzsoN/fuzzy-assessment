@@ -79,14 +79,22 @@ export interface CreateCampaignBody {
   sequenceSteps?: SequenceStep[];
 }
 
+export interface IdempotencyOptions {
+  idempotencyKey?: string;
+}
+
 export const campaignsApi = {
   list(): Promise<Campaign[]> {
     return request<Campaign[]>('/campaigns');
   },
 
-  create(body: CreateCampaignBody): Promise<Campaign> {
+  create(
+    body: CreateCampaignBody,
+    options: IdempotencyOptions = {},
+  ): Promise<Campaign> {
     return request<Campaign>('/campaigns', {
       method: 'POST',
+      headers: idempotencyHeaders(options.idempotencyKey),
       body: JSON.stringify(body),
     });
   },
@@ -121,3 +129,7 @@ export const campaignsApi = {
     });
   },
 };
+
+function idempotencyHeaders(idempotencyKey?: string) {
+  return idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined;
+}
