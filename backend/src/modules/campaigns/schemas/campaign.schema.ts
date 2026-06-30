@@ -56,6 +56,12 @@ export class CampaignContact {
 
   @Prop()
   error?: string;
+
+  @Prop()
+  generationAttemptId?: string;
+
+  @Prop()
+  generationLockedAt?: Date;
 }
 export const CampaignContactSchema = SchemaFactory.createForClass(CampaignContact);
 
@@ -97,6 +103,15 @@ export class Campaign {
 
   @Prop()
   generatedAt?: Date;
+
+  @Prop()
+  idempotencyScope?: string;
+
+  @Prop()
+  idempotencyKey?: string;
+
+  @Prop()
+  idempotencyFingerprint?: string;
 }
 
 export type CampaignDocument = Campaign & Document;
@@ -104,3 +119,13 @@ export const CampaignSchema = SchemaFactory.createForClass(Campaign);
 
 CampaignSchema.index({ userId: 1, createdAt: -1, _id: 1 });
 CampaignSchema.index({ userId: 1, status: 1, createdAt: -1, _id: 1 });
+CampaignSchema.index(
+  { userId: 1, idempotencyScope: 1, idempotencyKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      idempotencyScope: { $exists: true },
+      idempotencyKey: { $exists: true },
+    },
+  },
+);

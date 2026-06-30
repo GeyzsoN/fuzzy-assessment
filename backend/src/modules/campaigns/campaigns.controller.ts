@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
   Param,
   Patch,
   Post,
@@ -22,16 +23,21 @@ export class CampaignsController {
   constructor(private readonly campaignsService: CampaignsService) {}
 
   @Post()
-  create(@CurrentUser() userId: string, @Body() dto: CreateCampaignDto) {
-    return this.campaignsService.create(userId, dto);
+  create(
+    @CurrentUser() userId: string,
+    @Body() dto: CreateCampaignDto,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.campaignsService.create(userId, dto, idempotencyKey);
   }
 
   @Post('generate-draft')
   generateDraft(
     @CurrentUser() userId: string,
     @Body() dto: GenerateCampaignDraftDto,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.campaignsService.generateDraft(userId, dto);
+    return this.campaignsService.generateDraft(userId, dto, idempotencyKey);
   }
 
   @Get()

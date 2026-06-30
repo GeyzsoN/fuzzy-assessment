@@ -132,6 +132,10 @@ export interface CampaignOutboxData {
   generations: Record<string, ContactGeneration>;
 }
 
+export interface IdempotencyOptions {
+  idempotencyKey?: string;
+}
+
 export interface CampaignTemplate {
   id: string;
   key: string;
@@ -281,12 +285,13 @@ export const campaignsService = {
     targetGroupIds?: string[];
     targetContactIds?: string[];
     sequenceSteps?: SequenceStep[];
-  }): Promise<Campaign> {
+  }, options: IdempotencyOptions = {}): Promise<Campaign> {
     const steps = data.sequenceSteps?.length
       ? normalizeSteps(data.sequenceSteps)
       : undefined;
     const campaign = await request<BackendCampaign>('/campaigns', {
       method: 'POST',
+      headers: idempotencyHeaders(options.idempotencyKey),
       body: JSON.stringify({
         name: data.name,
         promptTemplate: data.promptTemplate || steps?.[0]?.promptTemplate,
@@ -332,9 +337,10 @@ export const campaignsService = {
     maxSteps?: number;
     targetGroupIds: string[];
     targetContactIds: string[];
-  }): Promise<Campaign> {
+  }, options: IdempotencyOptions = {}): Promise<Campaign> {
     const campaign = await request<BackendCampaign>('/campaigns/generate-draft', {
       method: 'POST',
+      headers: idempotencyHeaders(options.idempotencyKey),
       body: JSON.stringify({
         name: data.name,
         goal: data.goal,
@@ -445,6 +451,10 @@ export const campaignsService = {
     };
   },
 };
+
+function idempotencyHeaders(idempotencyKey?: string) {
+  return idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined;
+}
 
 interface BackendContact {
   _id: string;

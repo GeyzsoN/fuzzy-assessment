@@ -12,6 +12,7 @@ import { CampaignsService } from './campaigns.service';
 describe('campaign draft generation endpoints (e2e)', () => {
   let app: INestApplication;
   const campaignsService = {
+    create: jest.fn(),
     listTemplates: jest.fn(),
     generateDraft: jest.fn(),
   };
@@ -70,6 +71,7 @@ describe('campaign draft generation endpoints (e2e)', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    campaignsService.create.mockResolvedValue(draftResponse);
     campaignsService.listTemplates.mockResolvedValue(templateResponse);
     campaignsService.generateDraft.mockResolvedValue(draftResponse);
 
@@ -160,7 +162,43 @@ describe('campaign draft generation endpoints (e2e)', () => {
 
     expect(campaignsService.generateDraft).toHaveBeenCalledWith('user-1', {
       ...validGenerateDraftBody(),
-    });
+    }, undefined);
+  });
+
+  it('forwards Idempotency-Key for POST /campaigns/generate-draft', async () => {
+    await request(app.getHttpServer())
+      .post('/campaigns/generate-draft')
+      .set('x-user-id', 'user-1')
+      .set('Idempotency-Key', 'draft-submit-key')
+      .send(validGenerateDraftBody())
+      .expect(201);
+
+    expect(campaignsService.generateDraft).toHaveBeenCalledWith(
+      'user-1',
+      validGenerateDraftBody(),
+      'draft-submit-key',
+    );
+  });
+
+  it('forwards Idempotency-Key for POST /campaigns', async () => {
+    const body = {
+      name: 'Manual founder sequence',
+      promptTemplate: 'Hi {{first_name}}, checking in about {{company}}.',
+      contactIds: ['64a000000000000000000002'],
+    };
+
+    await request(app.getHttpServer())
+      .post('/campaigns')
+      .set('x-user-id', 'user-1')
+      .set('Idempotency-Key', 'create-submit-key')
+      .send(body)
+      .expect(201);
+
+    expect(campaignsService.create).toHaveBeenCalledWith(
+      'user-1',
+      body,
+      'create-submit-key',
+    );
   });
 
   it('returns a generating campaign response while the LLM job runs asynchronously', async () => {

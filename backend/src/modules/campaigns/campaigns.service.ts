@@ -1,5 +1,7 @@
 import {
   BadRequestException,
+  ConflictException,
+  HttpException,
   Injectable,
   NotFoundException,
   OnModuleInit,
@@ -63,6 +65,22 @@ type ResolvedRecipient = {
   snapshot: RecipientSnapshot;
 };
 
+type IdempotencyContext = {
+  scope: string;
+  key: string;
+  fingerprint: string;
+};
+
+const OUTBOX_PROCESSING_STALE_MS = 10 * 60 * 1000;
+const DIRECT_GENERATION_LEASE_MS = 10 * 60 * 1000;
+const GENERATABLE_CONTACT_STATUSES = [
+  GenerationStatus.NOT_GENERATED,
+  GenerationStatus.FAILED,
+];
+const IDEMPOTENCY_KEY_MAX_LENGTH = 128;
+const CREATE_CAMPAIGN_IDEMPOTENCY_SCOPE = 'campaign:create';
+const GENERATE_DRAFT_IDEMPOTENCY_SCOPE = 'campaign:generate-draft';
+
 @Injectable()
 export class CampaignsService implements OnModuleInit {
   constructor(
@@ -101,7 +119,18 @@ export class CampaignsService implements OnModuleInit {
   async generateDraft(
     userId: string,
     dto: GenerateCampaignDraftDto,
+    idempotencyKey?: string,
   ): Promise<any> {
+    const idempotency = this.buildIdempotencyContext(
+      GENERATE_DRAFT_IDEMPOTENCY_SCOPE,
+      idempotencyKey,
+      buildGenerateDraftFingerprintInput(dto),
+    );
+    const existing = await this.findIdempotentCampaign(userId, idempotency);
+    if (existing) {
+      return this.serializeCampaign(userId, existing);
+    }
+
     await this.validateTargets(userId, dto.groupIds || [], dto.contactIds || []);
     const campaignTemplate = await this.findCampaignTemplate(dto.templateId);
     const promptTemplate = await this.promptTemplateModel
@@ -114,31 +143,63 @@ export class CampaignsService implements OnModuleInit {
       throw new BadRequestException('Campaign generation prompt is not configured');
     }
 
-    const campaign = await this.campaignModel.create({
-      userId,
-      name: dto.name,
-      status: CampaignStatus.GENERATING,
-      targetGroupIds: toObjectIds(dto.groupIds || [], 'group'),
-      directContactIds: toObjectIds(dto.contactIds || [], 'contact'),
-      sequenceSteps: [],
-      contacts: makeCampaignContacts(dto.contactIds || []),
-    });
-
-    await this.campaignGenerationQueue.add(
-      CAMPAIGN_GENERATION_JOB,
-      {
+    let campaign: CampaignDocument;
+    try {
+      campaign = await this.campaignModel.create({
         userId,
-        campaignId: String(campaign._id),
-        dto,
-      },
-      {
-        jobId: makeBullJobId(CAMPAIGN_GENERATION_JOB, String(campaign._id)),
-        attempts: 2,
-        backoff: { type: 'exponential', delay: 1000 },
-        removeOnComplete: 1000,
-        removeOnFail: false,
-      },
-    );
+        name: dto.name,
+        status: CampaignStatus.GENERATING,
+        targetGroupIds: toObjectIds(dto.groupIds || [], 'group'),
+        directContactIds: toObjectIds(dto.contactIds || [], 'contact'),
+        sequenceSteps: [],
+        contacts: makeCampaignContacts(dto.contactIds || []),
+        ...(idempotency
+          ? {
+              idempotencyScope: idempotency.scope,
+              idempotencyKey: idempotency.key,
+              idempotencyFingerprint: idempotency.fingerprint,
+            }
+          : {}),
+      });
+    } catch (error) {
+      const raced = await this.resolveIdempotencyRace(userId, idempotency, error);
+      if (raced) {
+        return this.serializeCampaign(userId, raced);
+      }
+      throw error;
+    }
+
+    try {
+      await this.campaignGenerationQueue.add(
+        CAMPAIGN_GENERATION_JOB,
+        {
+          userId,
+          campaignId: String(campaign._id),
+          dto,
+        },
+        {
+          jobId: makeBullJobId(CAMPAIGN_GENERATION_JOB, String(campaign._id)),
+          attempts: 2,
+          backoff: { type: 'exponential', delay: 1000 },
+          removeOnComplete: 1000,
+          removeOnFail: false,
+        },
+      );
+    } catch (error) {
+      await this.campaignModel.updateOne(
+        { _id: campaign._id, userId, status: CampaignStatus.GENERATING },
+        {
+          $set: {
+            status: CampaignStatus.FAILED,
+            generationError: safeErrorMessage(
+              error,
+              'Campaign draft generation could not be queued',
+            ),
+          },
+        },
+      );
+      throw error;
+    }
 
     return this.serializeCampaign(userId, campaign);
   }
@@ -225,23 +286,53 @@ export class CampaignsService implements OnModuleInit {
     }
   }
 
-  async create(userId: string, dto: CreateCampaignDto): Promise<any> {
-    await this.validateTargets(userId, dto.groupIds || [], dto.contactIds || []);
+  async create(
+    userId: string,
+    dto: CreateCampaignDto,
+    idempotencyKey?: string,
+  ): Promise<any> {
     const sequenceSteps = normalizeSequenceSteps(
       dto.sequenceSteps,
       dto.promptTemplate,
     );
+    const idempotency = this.buildIdempotencyContext(
+      CREATE_CAMPAIGN_IDEMPOTENCY_SCOPE,
+      idempotencyKey,
+      buildCreateCampaignFingerprintInput(dto, sequenceSteps),
+    );
+    const existing = await this.findIdempotentCampaign(userId, idempotency);
+    if (existing) {
+      return this.serializeCampaign(userId, existing);
+    }
 
-    const campaign = await this.campaignModel.create({
-      userId,
-      name: dto.name,
-      status: CampaignStatus.DRAFT,
-      promptTemplate: dto.promptTemplate || sequenceSteps[0]?.promptTemplate,
-      targetGroupIds: toObjectIds(dto.groupIds || [], 'group'),
-      directContactIds: toObjectIds(dto.contactIds || [], 'contact'),
-      sequenceSteps,
-      contacts: makeCampaignContacts(dto.contactIds || []),
-    });
+    await this.validateTargets(userId, dto.groupIds || [], dto.contactIds || []);
+
+    let campaign: CampaignDocument;
+    try {
+      campaign = await this.campaignModel.create({
+        userId,
+        name: dto.name,
+        status: CampaignStatus.DRAFT,
+        promptTemplate: dto.promptTemplate || sequenceSteps[0]?.promptTemplate,
+        targetGroupIds: toObjectIds(dto.groupIds || [], 'group'),
+        directContactIds: toObjectIds(dto.contactIds || [], 'contact'),
+        sequenceSteps,
+        contacts: makeCampaignContacts(dto.contactIds || []),
+        ...(idempotency
+          ? {
+              idempotencyScope: idempotency.scope,
+              idempotencyKey: idempotency.key,
+              idempotencyFingerprint: idempotency.fingerprint,
+            }
+          : {}),
+      });
+    } catch (error) {
+      const raced = await this.resolveIdempotencyRace(userId, idempotency, error);
+      if (raced) {
+        return this.serializeCampaign(userId, raced);
+      }
+      throw error;
+    }
 
     return this.serializeCampaign(userId, campaign);
   }
@@ -347,26 +438,46 @@ export class CampaignsService implements OnModuleInit {
       throw new BadRequestException('One or more contacts were not found');
     }
 
-    const existing = new Set(
-      campaign.contacts.map((entry) => String(entry.contactId)),
+    const contactObjectIds = contacts.map(
+      (contact: any) => new Types.ObjectId(String(contact._id)),
     );
-    const direct = new Set(
-      (campaign.directContactIds || []).map((id) => String(id)),
-    );
-    contacts.forEach((contact: any) => {
-      const id = String(contact._id);
-      if (!existing.has(id)) {
-        campaign.contacts.push({
-          contactId: contact._id,
-          status: GenerationStatus.NOT_GENERATED,
-        });
-      }
-      direct.add(id);
-    });
+    const draftFilter = {
+      _id: campaign._id,
+      userId,
+      $or: [{ status: CampaignStatus.DRAFT }, { status: { $exists: false } }],
+    };
 
-    campaign.directContactIds = [...direct].map((id) => new Types.ObjectId(id));
-    await campaign.save();
-    return this.serializeCampaign(userId, campaign);
+    const directUpdate = await this.campaignModel.updateOne(draftFilter, {
+      $addToSet: { directContactIds: { $each: contactObjectIds } },
+    });
+    if (directUpdate.matchedCount === 0) {
+      throw new BadRequestException('Only draft campaigns can be edited');
+    }
+
+    if (contactObjectIds.length) {
+      await this.campaignModel.bulkWrite(
+        contactObjectIds.map((contactId) => ({
+          updateOne: {
+            filter: {
+              ...draftFilter,
+              $nor: [{ contacts: { $elemMatch: { contactId } } }],
+            },
+            update: {
+              $push: {
+                contacts: {
+                  contactId,
+                  status: GenerationStatus.NOT_GENERATED,
+                },
+              },
+            },
+          },
+        })),
+        { ordered: false },
+      );
+    }
+
+    const updated = await this.requireCampaign(userId, campaignId);
+    return this.serializeCampaign(userId, updated);
   }
 
   async launch(userId: string, campaignId: string): Promise<any> {
@@ -408,15 +519,35 @@ export class CampaignsService implements OnModuleInit {
       throw new BadRequestException('Campaign has already been launched');
     }
 
-    await this.snapshotRecipients(userId, claimed, recipients);
-    const firstStep = sequenceSteps[0];
-    for (const recipient of recipients) {
-      await this.scheduleOutboxForStep(userId, claimed, recipient, firstStep);
-    }
+    try {
+      await this.snapshotRecipients(userId, claimed, recipients);
+      const firstStep = sequenceSteps[0];
+      for (const recipient of recipients) {
+        await this.scheduleOutboxForStep(userId, claimed, recipient, firstStep);
+      }
 
-    claimed.status = CampaignStatus.RUNNING;
-    await claimed.save();
-    return this.serializeCampaign(userId, claimed);
+      await this.campaignModel.updateOne(
+        { _id: claimed._id, userId, status: CampaignStatus.LAUNCHING },
+        {
+          $set: { status: CampaignStatus.RUNNING },
+          $unset: { generationError: '' },
+        },
+      );
+
+      const updated = await this.requireCampaign(userId, campaignId);
+      return this.serializeCampaign(userId, updated);
+    } catch (error) {
+      await this.campaignModel.updateOne(
+        { _id: claimed._id, userId, status: CampaignStatus.LAUNCHING },
+        {
+          $set: {
+            status: CampaignStatus.FAILED,
+            generationError: safeErrorMessage(error, 'Campaign launch failed'),
+          },
+        },
+      );
+      throw error;
+    }
   }
 
   async generateSequence(userId: string, campaignId: string): Promise<any> {
@@ -466,8 +597,12 @@ export class CampaignsService implements OnModuleInit {
       contactIds,
     };
 
-    await this.campaignModel.updateOne(
-      { _id: campaign._id, userId },
+    const claimed = await this.campaignModel.findOneAndUpdate(
+      {
+        _id: campaign._id,
+        userId,
+        status: { $in: [CampaignStatus.DRAFT, CampaignStatus.FAILED] },
+      },
       {
         $set: {
           status: CampaignStatus.GENERATING,
@@ -477,22 +612,45 @@ export class CampaignsService implements OnModuleInit {
         },
         $unset: { generationError: '' },
       },
+      { new: true },
     );
+    if (!claimed) {
+      const latest = await this.requireCampaign(userId, campaignId);
+      if (latest.status === CampaignStatus.GENERATING) {
+        return this.serializeCampaign(userId, latest);
+      }
+      throw new BadRequestException('Only draft campaigns can generate a sequence');
+    }
 
-    await this.campaignGenerationQueue.add(
-      CAMPAIGN_GENERATION_JOB,
-      { userId, campaignId: String(campaign._id), dto },
-      {
-        jobId: makeBullJobId(CAMPAIGN_GENERATION_JOB, String(campaign._id)),
-        attempts: 2,
-        backoff: { type: 'exponential', delay: 1000 },
-        removeOnComplete: 1000,
-        removeOnFail: false,
-      },
-    );
+    try {
+      await this.campaignGenerationQueue.add(
+        CAMPAIGN_GENERATION_JOB,
+        { userId, campaignId: String(claimed._id), dto },
+        {
+          jobId: makeBullJobId(CAMPAIGN_GENERATION_JOB, String(claimed._id)),
+          attempts: 2,
+          backoff: { type: 'exponential', delay: 1000 },
+          removeOnComplete: 1000,
+          removeOnFail: false,
+        },
+      );
+    } catch (error) {
+      await this.campaignModel.updateOne(
+        { _id: claimed._id, userId, status: CampaignStatus.GENERATING },
+        {
+          $set: {
+            status: CampaignStatus.FAILED,
+            generationError: safeErrorMessage(
+              error,
+              'Campaign sequence generation could not be queued',
+            ),
+          },
+        },
+      );
+      throw error;
+    }
 
-    const updated = await this.requireCampaign(userId, campaignId);
-    return this.serializeCampaign(userId, updated);
+    return this.serializeCampaign(userId, claimed);
   }
 
   async getOutbox(userId: string, campaignId: string): Promise<any[]> {
@@ -590,9 +748,47 @@ export class CampaignsService implements OnModuleInit {
       throw new BadRequestException('Contact is not attached to this campaign');
     }
 
-    entry.status = GenerationStatus.PENDING;
-    entry.error = undefined;
-    await campaign.save();
+    const generationAttemptId = new Types.ObjectId().toHexString();
+    const staleGenerationLockedBefore = new Date(
+      Date.now() - DIRECT_GENERATION_LEASE_MS,
+    );
+    const claimed = await this.campaignModel.findOneAndUpdate(
+      {
+        _id: campaign._id,
+        userId,
+        contacts: {
+          $elemMatch: {
+            contactId: outboxContactId,
+            $or: [
+              { status: { $in: GENERATABLE_CONTACT_STATUSES } },
+              {
+                status: GenerationStatus.PENDING,
+                generationLockedAt: { $lte: staleGenerationLockedBefore },
+              },
+            ],
+          },
+        },
+      },
+      {
+        $set: {
+          'contacts.$.status': GenerationStatus.PENDING,
+          'contacts.$.generationAttemptId': generationAttemptId,
+          'contacts.$.generationLockedAt': new Date(),
+        },
+        $unset: {
+          'contacts.$.error': '',
+          'contacts.$.generatedMessage': '',
+        },
+      },
+      { new: true },
+    );
+    if (!claimed) {
+      return this.readCampaignContactResult(
+        userId,
+        campaign._id,
+        outboxContactId,
+      );
+    }
 
     try {
       const template =
@@ -609,20 +805,75 @@ export class CampaignsService implements OnModuleInit {
         throw new BadRequestException('LLM returned an empty message');
       }
 
-      entry.status = GenerationStatus.FINISHED;
-      entry.generatedMessage = message;
-      entry.error = undefined;
-      await campaign.save();
+      const finished = await this.campaignModel.findOneAndUpdate(
+        {
+          _id: campaign._id,
+          userId,
+          contacts: {
+            $elemMatch: {
+              contactId: outboxContactId,
+              status: GenerationStatus.PENDING,
+              generationAttemptId,
+            },
+          },
+        },
+        {
+          $set: {
+            'contacts.$.status': GenerationStatus.FINISHED,
+            'contacts.$.generatedMessage': message,
+          },
+          $unset: {
+            'contacts.$.error': '',
+            'contacts.$.generationAttemptId': '',
+            'contacts.$.generationLockedAt': '',
+          },
+        },
+        { new: true },
+      );
+      if (!finished) {
+        return this.readCampaignContactResult(
+          userId,
+          campaign._id,
+          outboxContactId,
+        );
+      }
 
-      return { status: entry.status, message };
+      return { status: GenerationStatus.FINISHED, message };
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : 'Message generation failed';
-      entry.status = GenerationStatus.FAILED;
-      entry.error = message;
-      await campaign.save();
+      const message = safeErrorMessage(error, 'Message generation failed');
+      const failed = await this.campaignModel.updateOne(
+        {
+          _id: campaign._id,
+          userId,
+          contacts: {
+            $elemMatch: {
+              contactId: outboxContactId,
+              status: GenerationStatus.PENDING,
+              generationAttemptId,
+            },
+          },
+        },
+        {
+          $set: {
+            'contacts.$.status': GenerationStatus.FAILED,
+            'contacts.$.error': message,
+          },
+          $unset: {
+            'contacts.$.generatedMessage': '',
+            'contacts.$.generationAttemptId': '',
+            'contacts.$.generationLockedAt': '',
+          },
+        },
+      );
+      if (failed.matchedCount === 0) {
+        return this.readCampaignContactResult(
+          userId,
+          campaign._id,
+          outboxContactId,
+        );
+      }
 
-      return { status: entry.status, error: message };
+      return { status: GenerationStatus.FAILED, error: message };
     }
   }
 
@@ -636,10 +887,17 @@ export class CampaignsService implements OnModuleInit {
       return;
     }
 
+    const staleLockedBefore = new Date(Date.now() - OUTBOX_PROCESSING_STALE_MS);
     const claimed = await this.outboxModel.findOneAndUpdate(
       {
         _id: new Types.ObjectId(outboxId),
-        status: { $in: [OutboxStatus.QUEUED, OutboxStatus.FAILED] },
+        $or: [
+          { status: { $in: [OutboxStatus.QUEUED, OutboxStatus.FAILED] } },
+          {
+            status: OutboxStatus.PROCESSING,
+            lockedAt: { $lte: staleLockedBefore },
+          },
+        ],
       },
       {
         $set: {
@@ -723,6 +981,77 @@ export class CampaignsService implements OnModuleInit {
       );
       throw error;
     }
+  }
+
+  private async readCampaignContactResult(
+    userId: string,
+    campaignId: Types.ObjectId,
+    contactId: Types.ObjectId,
+  ): Promise<{ status: string; message?: string; error?: string }> {
+    const campaign = await this.campaignModel
+      .findOne({ _id: campaignId, userId, 'contacts.contactId': contactId })
+      .lean()
+      .exec();
+    const entry = campaign?.contacts?.find(
+      (campaignContact: any) => String(campaignContact.contactId) === String(contactId),
+    );
+    if (!entry) {
+      throw new BadRequestException('Contact is not attached to this campaign');
+    }
+
+    return generationResultFromEntry(entry);
+  }
+
+  private buildIdempotencyContext(
+    scope: string,
+    idempotencyKey: string | undefined,
+    payload: unknown,
+  ): IdempotencyContext | undefined {
+    const key = normalizeIdempotencyKey(idempotencyKey);
+    if (!key) {
+      return undefined;
+    }
+    return {
+      scope,
+      key,
+      fingerprint: stableStringify(payload),
+    };
+  }
+
+  private async findIdempotentCampaign(
+    userId: string,
+    idempotency: IdempotencyContext | undefined,
+  ): Promise<CampaignDocument | undefined> {
+    if (!idempotency) {
+      return undefined;
+    }
+
+    const existing = await this.campaignModel.findOne({
+      userId,
+      idempotencyScope: idempotency.scope,
+      idempotencyKey: idempotency.key,
+    });
+    if (!existing) {
+      return undefined;
+    }
+
+    if (existing.idempotencyFingerprint !== idempotency.fingerprint) {
+      throw new ConflictException(
+        'Idempotency-Key was already used with a different request payload',
+      );
+    }
+    return existing;
+  }
+
+  private async resolveIdempotencyRace(
+    userId: string,
+    idempotency: IdempotencyContext | undefined,
+    error: unknown,
+  ): Promise<CampaignDocument | undefined> {
+    if (!idempotency || !isDuplicateKeyError(error)) {
+      return undefined;
+    }
+    return this.findIdempotentCampaign(userId, idempotency);
   }
 
   private async requireCampaign(userId: string, campaignId: string) {
@@ -1005,7 +1334,7 @@ export class CampaignsService implements OnModuleInit {
     return {
       ...serializeCampaignPlain(plain),
       contacts: plain.contacts.map((entry) => ({
-        ...entry,
+        ...serializeCampaignContactPlain(entry),
         contactId: String(entry.contactId),
         contact: contactsById.get(String(entry.contactId)),
       })),
@@ -1029,6 +1358,42 @@ function toObjectIds(ids: string[], label: string) {
   });
 }
 
+function buildCreateCampaignFingerprintInput(
+  dto: CreateCampaignDto,
+  sequenceSteps: SequenceStep[],
+) {
+  return {
+    name: dto.name,
+    promptTemplate: dto.promptTemplate || sequenceSteps[0]?.promptTemplate || null,
+    groupIds: normalizeIdList(dto.groupIds || []),
+    contactIds: normalizeIdList(dto.contactIds || []),
+    sequenceSteps: sequenceSteps.map((step) => ({
+      stepId: step.stepId,
+      order: step.order,
+      delayMinutes: step.delayMinutes,
+      subjectTemplate: step.subjectTemplate,
+      promptTemplate: step.promptTemplate,
+    })),
+  };
+}
+
+function buildGenerateDraftFingerprintInput(dto: GenerateCampaignDraftDto) {
+  return {
+    name: dto.name,
+    goal: dto.goal,
+    audienceDescription: dto.audienceDescription,
+    templateId: dto.templateId,
+    tone: dto.tone || null,
+    maxSteps: dto.maxSteps || null,
+    groupIds: normalizeIdList(dto.groupIds || []),
+    contactIds: normalizeIdList(dto.contactIds || []),
+  };
+}
+
+function normalizeIdList(ids: string[]) {
+  return [...new Set(ids)].sort();
+}
+
 function makeCampaignContacts(contactIds: string[]) {
   return toObjectIds(contactIds, 'contact').map((contactId) => ({
     contactId,
@@ -1037,13 +1402,35 @@ function makeCampaignContacts(contactIds: string[]) {
 }
 
 function serializeCampaignPlain(campaign: any) {
+  const {
+    idempotencyScope: _idempotencyScope,
+    idempotencyKey: _idempotencyKey,
+    idempotencyFingerprint: _idempotencyFingerprint,
+    ...publicCampaign
+  } = campaign || {};
+
   return {
-    ...campaign,
-    _id: String(campaign._id),
-    targetGroupIds: (campaign.targetGroupIds || []).map((id) => String(id)),
-    directContactIds: (campaign.directContactIds || []).map((id) => String(id)),
-    sequenceSteps: campaign.sequenceSteps || [],
-    contacts: campaign.contacts || [],
+    ...publicCampaign,
+    _id: String(publicCampaign._id),
+    targetGroupIds: (publicCampaign.targetGroupIds || []).map((id) => String(id)),
+    directContactIds: (publicCampaign.directContactIds || []).map((id) =>
+      String(id),
+    ),
+    sequenceSteps: publicCampaign.sequenceSteps || [],
+    contacts: (publicCampaign.contacts || []).map(serializeCampaignContactPlain),
+  };
+}
+
+function serializeCampaignContactPlain(entry: any) {
+  const plain = typeof entry?.toObject === 'function' ? entry.toObject() : entry;
+  const {
+    generationAttemptId: _generationAttemptId,
+    generationLockedAt: _generationLockedAt,
+    ...rest
+  } = plain || {};
+  return {
+    ...rest,
+    contactId: rest?.contactId ? String(rest.contactId) : rest?.contactId,
   };
 }
 
@@ -1083,6 +1470,69 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   } finally {
     clearTimeout(timeout!);
   }
+}
+
+function generationResultFromEntry(entry: any) {
+  if (entry.status === GenerationStatus.FINISHED) {
+    return { status: entry.status, message: entry.generatedMessage };
+  }
+  if (entry.status === GenerationStatus.FAILED) {
+    return { status: entry.status, error: entry.error || 'Message generation failed' };
+  }
+  return { status: entry.status || GenerationStatus.NOT_GENERATED };
+}
+
+function safeErrorMessage(error: unknown, fallback: string) {
+  if (error instanceof HttpException) {
+    const response = error.getResponse();
+    if (typeof response === 'string') {
+      return response;
+    }
+    if (typeof response === 'object' && response !== null && 'message' in response) {
+      const message = (response as { message?: string | string[] }).message;
+      return Array.isArray(message) ? message[0] || fallback : message || fallback;
+    }
+  }
+
+  if (error instanceof Error && /timed out/i.test(error.message)) {
+    return error.message;
+  }
+
+  return fallback;
+}
+
+function normalizeIdempotencyKey(value?: string) {
+  const key = (value || '').trim();
+  if (!key) {
+    return undefined;
+  }
+  if (key.length > IDEMPOTENCY_KEY_MAX_LENGTH) {
+    throw new BadRequestException('Idempotency-Key is too long');
+  }
+  return key;
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableStringify(entry)).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableStringify(object[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+function isDuplicateKeyError(error: unknown) {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: number }).code === 11000
+  );
 }
 
 function inferRequestedStepCount(value: string): number | undefined {
