@@ -26,7 +26,9 @@ import {
   Search,
 } from 'lucide-react';
 import Shell from '@/components/shell';
+import RequireAuth from '@/components/require-auth';
 import { campaignsService, groupsService, contactsService, Group, Contact, Campaign, CampaignTemplate } from '@/services/api';
+import { formatCount, formatDurationUnit } from '@/lib/format';
 
 interface BuilderStep {
   order: number;
@@ -157,9 +159,11 @@ function matchesSearch(query: string, values: Array<string | number | undefined 
 
 export default function CampaignsPage() {
   return (
-    <Suspense fallback={<Shell><div className="text-sm text-slate-500">Loading campaigns...</div></Shell>}>
-      <CampaignsPageContent />
-    </Suspense>
+    <RequireAuth loadingLabel="Checking campaign access...">
+      <Suspense fallback={<Shell><div className="text-sm text-slate-500">Loading campaigns...</div></Shell>}>
+        <CampaignsPageContent />
+      </Suspense>
+    </RequireAuth>
   );
 }
 
@@ -247,6 +251,8 @@ function CampaignsPageContent() {
   const wizardSubmitIdempotencyKeyRef = useRef<string | null>(null);
   const coreSubmitIdempotencyKeyRef = useRef<string | null>(null);
   const legacySubmitIdempotencyKeyRef = useRef<string | null>(null);
+  const [creatingDebugRecoveryCampaign, setCreatingDebugRecoveryCampaign] = useState(false);
+  const debugGenerationTriggersEnabled = process.env.NODE_ENV !== 'production';
 
   const updateCampaignsUrl = useCallback(
     (
@@ -499,6 +505,48 @@ function CampaignsPageContent() {
   const openWizard = () => {
     initializeWizard(1);
     updateCampaignsUrl({ wizard: true, step: 1 });
+  };
+
+  const handleCreateDebugRecoveryCampaign = async () => {
+    setCreatingDebugRecoveryCampaign(true);
+    setLoadError(null);
+
+    try {
+      const recipient =
+        contacts[0] ||
+        (await contactsService.create({
+          name: 'Recovery Test Recipient',
+          email: `recovery-test-${Date.now()}@example.com`,
+          company: 'ExampleCo',
+          title: 'Operations Lead',
+        }));
+
+      const campaign = await campaignsService.create(
+        {
+          name: `Recovery Test - ${new Date().toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+          })}`,
+          targetContactIds: [recipient.id],
+          sequenceSteps: [
+            {
+              order: 1,
+              delayMinutes: 0,
+              subjectTemplate: 'Recovery test for {{company}}',
+              promptTemplate:
+                'Hi {{first_name}},\n\nThis is a draft campaign for testing generation recovery after a worker crash.\n\nBest,\nDemo',
+            },
+          ],
+        },
+        { idempotencyKey: createIdempotencyKey() },
+      );
+
+      router.push(`/campaigns/${campaign.id}`);
+    } catch (err: any) {
+      setLoadError(err.message || 'Failed to create recovery test campaign.');
+    } finally {
+      setCreatingDebugRecoveryCampaign(false);
+    }
   };
 
   const closeWizard = () => {
@@ -985,6 +1033,21 @@ function CampaignsPageContent() {
           >
             <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
           </button>
+
+          {debugGenerationTriggersEnabled && (
+            <button
+              onClick={handleCreateDebugRecoveryCampaign}
+              disabled={creatingDebugRecoveryCampaign}
+              className="inline-flex items-center justify-center px-3 py-2.5 border border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100 disabled:bg-slate-100 disabled:text-slate-400 font-bold text-xs rounded-xl transition-colors shadow-sm cursor-pointer"
+            >
+              {creatingDebugRecoveryCampaign ? (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              ) : (
+                <Plus className="h-4 w-4 mr-2" />
+              )}
+              Recovery Test
+            </button>
+          )}
           
           <button
             onClick={openWizard}
@@ -1069,7 +1132,7 @@ function CampaignsPageContent() {
                           className="h-4 w-4 text-indigo-600 accent-indigo-600 border-slate-300 rounded focus:ring-0"
                         />
                         <span className="font-semibold">
-                          {group.name} ({group.memberCount} contacts)
+                          {group.name} ({formatCount(group.memberCount, 'contact')})
                         </span>
                       </label>
                     ))
@@ -1288,7 +1351,7 @@ function CampaignsPageContent() {
                           <td className="px-6 py-4">
                             <div className="font-semibold text-slate-900">{camp.name}</div>
                             <div className="text-xs text-slate-400 font-medium mt-0.5">
-                              {camp.contacts.length} attached contacts
+                              {formatCount(camp.contacts.length, 'attached contact')}
                             </div>
                           </td>
                           <td className="px-6 py-4">
@@ -1299,19 +1362,19 @@ function CampaignsPageContent() {
                           <td className="px-6 py-4 text-slate-500 font-medium">
                             {camp.status === 'draft' || camp.status === 'generating' ? (
                               <span className="text-xs text-slate-500">
-                                {camp.targetGroupIds.length} groups · {camp.contacts.length} contacts
+                                {formatCount(camp.targetGroupIds.length, 'group')} · {formatCount(camp.contacts.length, 'contact')}
                               </span>
                             ) : (
                               <span className="inline-flex items-center text-xs">
                                 <Users className="h-3.5 w-3.5 mr-1 text-slate-400" />
-                                {camp.recipients ? camp.recipients.length : 0} recipients
+                                {formatCount(camp.recipients ? camp.recipients.length : 0, 'recipient')}
                               </span>
                             )}
                           </td>
                           <td className="px-6 py-4 font-semibold text-slate-800">
                             <span className="inline-flex items-center px-2.5 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-semibold">
                               <ListOrdered className="h-3.5 w-3.5 mr-1.5 text-slate-500" />
-                              {camp.sequenceSteps ? camp.sequenceSteps.length : 0} steps
+                              {formatCount(camp.sequenceSteps ? camp.sequenceSteps.length : 0, 'step')}
                             </span>
                           </td>
                           <td className="px-6 py-4 text-right">
@@ -1440,7 +1503,7 @@ function CampaignsPageContent() {
                               onChange={() => handleGroupToggle(group.id)}
                               className="h-4 w-4 text-indigo-600 accent-indigo-600 border-slate-300 rounded focus:ring-0"
                             />
-                            <span className="font-semibold">{group.name} ({group.memberCount} members)</span>
+                            <span className="font-semibold">{group.name} ({formatCount(group.memberCount, 'member')})</span>
                           </label>
                         ))
                       )}
@@ -1927,7 +1990,7 @@ function CampaignsPageContent() {
                                       )}
                                       className="h-4 w-4 text-indigo-600 accent-indigo-600 border-slate-300 rounded"
                                     />
-                                    <span className="font-semibold">{group.name} ({group.memberCount} members)</span>
+                                    <span className="font-semibold">{group.name} ({formatCount(group.memberCount, 'member')})</span>
                                   </label>
                                 ))
                               )}
@@ -2218,17 +2281,17 @@ function CampaignsPageContent() {
                             </div>
                             <div>
                               <span className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">Drip Steps Length</span>
-                              <span className="font-bold text-slate-800">{wizardStepsCount} Steps</span>
+                              <span className="font-bold text-slate-800">{formatCount(wizardStepsCount, 'Step')}</span>
                             </div>
                             <div>
                               <span className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">Delay Interval</span>
-                              <span className="font-bold text-slate-800">{wizardDelayAmount} {wizardDelayUnit}</span>
+                              <span className="font-bold text-slate-800">{wizardDelayAmount} {formatDurationUnit(wizardDelayAmount, wizardDelayUnit)}</span>
                             </div>
                           </>
                         ) : (
                           <div>
                             <span className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-0.5">Drip Steps Length</span>
-                            <span className="font-bold text-slate-800">{wizardStepsCount} Sequence Steps</span>
+                            <span className="font-bold text-slate-800">{formatCount(wizardStepsCount, 'Sequence Step')}</span>
                           </div>
                         )}
                         <div className="col-span-2 border-t border-slate-150 pt-3">
@@ -2236,12 +2299,12 @@ function CampaignsPageContent() {
                           <div className="flex flex-wrap gap-2 text-[11px]">
                             {wizardSelectedGroupIds.length > 0 && (
                               <span className="px-2 py-0.5 bg-indigo-50 border border-indigo-100 rounded-md font-semibold text-indigo-700">
-                                {wizardSelectedGroupIds.length} Segments Selected
+                                {formatCount(wizardSelectedGroupIds.length, 'Segment')} Selected
                               </span>
                             )}
                             {wizardSelectedContactIds.length > 0 && (
                               <span className="px-2 py-0.5 bg-slate-100 border border-slate-200 rounded-md font-semibold text-slate-600">
-                                {wizardSelectedContactIds.length} Direct Contacts
+                                {formatCount(wizardSelectedContactIds.length, 'Direct Contact')}
                               </span>
                             )}
                             {wizardRawImportText.trim() && (

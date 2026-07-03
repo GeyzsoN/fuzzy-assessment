@@ -2,7 +2,10 @@ import { Types } from 'mongoose';
 import { CampaignsService } from './campaigns.service';
 import { CampaignStatus, GenerationStatus } from './schemas/campaign.schema';
 import { OutboxStatus } from './schemas/outbox-message.schema';
-import { SEQUENCE_EMAIL_JOB } from './sequence-queue.constants';
+import {
+  CAMPAIGN_GENERATION_JOB,
+  SEQUENCE_EMAIL_JOB,
+} from './sequence-queue.constants';
 
 describe('CampaignsService workflow hardening', () => {
   const userId = 'user-1';
@@ -593,7 +596,12 @@ describe('CampaignsService workflow hardening', () => {
     ).rejects.toThrow('redis unavailable');
 
     expect(campaignModel.updateOne).toHaveBeenCalledWith(
-      { _id: campaignId, userId, status: CampaignStatus.GENERATING },
+      expect.objectContaining({
+        _id: campaignId,
+        userId,
+        status: CampaignStatus.GENERATING,
+        generationAttemptId: expect.any(String),
+      }),
       expect.objectContaining({
         $set: expect.objectContaining({
           status: CampaignStatus.FAILED,
@@ -668,7 +676,12 @@ describe('CampaignsService workflow hardening', () => {
     ).rejects.toThrow('redis unavailable');
 
     expect(campaignModel.updateOne).toHaveBeenCalledWith(
-      { _id: campaignId, userId, status: CampaignStatus.GENERATING },
+      expect.objectContaining({
+        _id: campaignId,
+        userId,
+        status: CampaignStatus.GENERATING,
+        generationAttemptId: expect.any(String),
+      }),
       expect.objectContaining({
         $set: expect.objectContaining({
           status: CampaignStatus.FAILED,
@@ -719,7 +732,12 @@ describe('CampaignsService workflow hardening', () => {
 
     expect(campaignGenerationQueue.add).not.toHaveBeenCalled();
     expect(campaignModel.updateOne).toHaveBeenCalledWith(
-      { _id: campaignId, userId, status: CampaignStatus.GENERATING },
+      expect.objectContaining({
+        _id: campaignId,
+        userId,
+        status: CampaignStatus.GENERATING,
+        generationAttemptId: expect.any(String),
+      }),
       expect.objectContaining({
         $set: expect.objectContaining({
           status: CampaignStatus.FAILED,
@@ -729,6 +747,492 @@ describe('CampaignsService workflow hardening', () => {
         }),
       }),
     );
+  });
+
+  it('stores recovery metadata before queueing initial draft generation', async () => {
+    const campaignId = new Types.ObjectId();
+    const campaign = makeCampaign(campaignId, new Types.ObjectId(), []);
+    campaignTemplateModel.findOne.mockReturnValueOnce(
+      query({
+        _id: new Types.ObjectId(),
+        key: 'cold-intro',
+        name: 'Cold intro',
+        defaultMaxSteps: 3,
+        promptTemplateKey: 'sequence-draft-v1',
+        steps: [],
+      }),
+    );
+    promptTemplateModel.findOne.mockReturnValueOnce(
+      query({
+        key: 'sequence-draft-v1',
+        name: 'Sequence draft',
+        systemPrompt: 'System',
+        userPrompt: 'User',
+      }),
+    );
+    campaignModel.create.mockImplementation(async (doc: any) => ({
+      ...campaign,
+      ...doc,
+      _id: campaignId,
+    }));
+    jest.spyOn(service as any, 'serializeCampaign').mockResolvedValue({
+      status: CampaignStatus.GENERATING,
+    });
+
+    await service.generateDraft(userId, {
+      name: 'Generated sequence',
+      goal: 'Book calls',
+      audienceDescription: 'Founders',
+      templateId: 'cold-intro',
+      tone: 'direct',
+      maxSteps: 3,
+      groupIds: [],
+      contactIds: [],
+    });
+
+    const createPayload = campaignModel.create.mock.calls[0][0];
+    expect(createPayload).toMatchObject({
+      status: CampaignStatus.GENERATING,
+      generationAttemptId: expect.any(String),
+      generationLockedAt: expect.any(Date),
+      generationAttempts: 1,
+      lastAttemptedAt: expect.any(Date),
+      generationRequest: {
+        name: 'Generated sequence',
+        goal: 'Book calls',
+        audienceDescription: 'Founders',
+        templateId: 'cold-intro',
+        tone: 'direct',
+        maxSteps: 3,
+        groupIds: [],
+        contactIds: [],
+      },
+    });
+    expect(campaignGenerationQueue.add).toHaveBeenCalledWith(
+      CAMPAIGN_GENERATION_JOB,
+      expect.objectContaining({
+        campaignId: String(campaignId),
+        userId,
+        generationAttemptId: createPayload.generationAttemptId,
+      }),
+      expect.objectContaining({
+        jobId: expect.stringContaining(createPayload.generationAttemptId),
+        removeOnFail: false,
+      }),
+    );
+  });
+
+  it('writes campaign draft generation success only for the matching attempt', async () => {
+    const campaignId = new Types.ObjectId();
+    const contactId = new Types.ObjectId();
+    const attemptId = 'attempt-current';
+    const campaign = makeCampaign(campaignId, contactId);
+    campaign.status = CampaignStatus.GENERATING;
+    campaign.generationAttemptId = attemptId;
+    jest.spyOn(service as any, 'requireCampaign').mockResolvedValue(campaign);
+    campaignTemplateModel.findOne.mockReturnValueOnce(
+      query({
+        _id: new Types.ObjectId(),
+        key: 'cold-intro',
+        defaultMaxSteps: 1,
+        promptTemplateKey: 'sequence-draft-v1',
+        steps: [
+          {
+            order: 1,
+            delayDays: 0,
+            subjectTemplate: 'Idea for {{company}}',
+            promptTemplate: 'Hi {{first_name}}, quick idea for {{company}}.',
+          },
+        ],
+      }),
+    );
+    promptTemplateModel.findOne.mockReturnValueOnce(
+      query({
+        key: 'sequence-draft-v1',
+        systemPrompt: 'System',
+        userPrompt: 'Goal {{goal}} audience {{audienceDescription}}',
+      }),
+    );
+    llm.complete.mockResolvedValue(
+      JSON.stringify([
+        {
+          order: 1,
+          delayDays: 0,
+          subjectTemplate: 'Idea for {{company}}',
+          promptTemplate: 'Hi {{first_name}}, quick idea for {{company}}.',
+        },
+      ]),
+    );
+
+    await service.processCampaignDraftGeneration({
+      userId,
+      campaignId: String(campaignId),
+      generationAttemptId: attemptId,
+      dto: {
+        name: 'Generated sequence',
+        goal: 'Book calls',
+        audienceDescription: 'Founders',
+        templateId: 'cold-intro',
+        maxSteps: 1,
+        groupIds: [],
+        contactIds: [],
+      },
+    });
+
+    const successCall = campaignModel.updateOne.mock.calls.find(
+      (call: any[]) => call[1]?.$set?.status === CampaignStatus.DRAFT,
+    );
+    expect(successCall?.[0]).toMatchObject({
+      _id: campaignId,
+      userId,
+      status: CampaignStatus.GENERATING,
+      generationAttemptId: attemptId,
+    });
+    expect(successCall?.[1]).toMatchObject({
+      $set: expect.objectContaining({
+        status: CampaignStatus.DRAFT,
+        sequenceSteps: expect.arrayContaining([
+          expect.objectContaining({ stepId: 'step-1' }),
+        ]),
+      }),
+      $unset: expect.objectContaining({
+        generationAttemptId: '',
+        generationLockedAt: '',
+        generationAttempts: '',
+        generationRequest: '',
+      }),
+    });
+  });
+
+  it('does not let a stale campaign draft worker overwrite a newer attempt', async () => {
+    const campaignId = new Types.ObjectId();
+    const campaign = makeCampaign(campaignId, new Types.ObjectId());
+    campaign.status = CampaignStatus.GENERATING;
+    campaign.generationAttemptId = 'new-attempt';
+    jest.spyOn(service as any, 'requireCampaign').mockResolvedValue(campaign);
+
+    await service.processCampaignDraftGeneration({
+      userId,
+      campaignId: String(campaignId),
+      generationAttemptId: 'old-attempt',
+      dto: {
+        name: 'Generated sequence',
+        goal: 'Book calls',
+        audienceDescription: 'Founders',
+        templateId: 'cold-intro',
+        maxSteps: 1,
+        groupIds: [],
+        contactIds: [],
+      },
+    });
+
+    expect(llm.complete).not.toHaveBeenCalled();
+    expect(campaignModel.updateOne).not.toHaveBeenCalled();
+  });
+
+  it('re-enqueues stale generating campaigns with a new attempt id', async () => {
+    const now = new Date('2026-07-01T00:00:00.000Z');
+    const campaignId = new Types.ObjectId();
+    const stale = {
+      _id: campaignId,
+      userId,
+      status: CampaignStatus.GENERATING,
+      generationAttemptId: 'old-attempt',
+      generationLockedAt: new Date(now.getTime() - 20 * 60 * 1000),
+      generationAttempts: 1,
+      generationRequest: makeGenerationRequest(),
+    };
+    campaignModel.find.mockReturnValueOnce(query([stale]));
+    campaignModel.findOneAndUpdate.mockResolvedValueOnce({
+      ...stale,
+      generationAttemptId: 'new-attempt',
+    });
+
+    const result = await service.recoverStaleCampaignGenerations({ now });
+
+    expect(result).toEqual({ scanned: 1, requeued: 1, failed: 0 });
+    expect(campaignModel.findOneAndUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _id: campaignId,
+        userId,
+        status: CampaignStatus.GENERATING,
+        generationAttemptId: 'old-attempt',
+        $or: expect.arrayContaining([
+          { generationLockedAt: { $lte: expect.any(Date) } },
+        ]),
+      }),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          generationAttemptId: expect.any(String),
+          generationLockedAt: now,
+          generationError: 'Recovery attempt queued',
+        }),
+        $inc: { generationAttempts: 1 },
+      }),
+      { new: true },
+    );
+    expect(campaignGenerationQueue.add).toHaveBeenCalledWith(
+      CAMPAIGN_GENERATION_JOB,
+      expect.objectContaining({
+        campaignId: String(campaignId),
+        userId,
+        generationAttemptId: expect.not.stringMatching('old-attempt'),
+      }),
+      expect.objectContaining({
+        jobId: expect.stringContaining(String(campaignId)),
+      }),
+    );
+    expect(llmQuotaUsageModel.findOneAndUpdate).not.toHaveBeenCalled();
+  });
+
+  it('marks old stuck campaigns failed when recovery metadata is missing', async () => {
+    const now = new Date('2026-07-01T00:00:00.000Z');
+    const campaignId = new Types.ObjectId();
+    campaignModel.find.mockReturnValueOnce(
+      query([
+        {
+          _id: campaignId,
+          userId,
+          status: CampaignStatus.GENERATING,
+          generationAttemptId: 'old-attempt',
+          generationLockedAt: new Date(now.getTime() - 20 * 60 * 1000),
+        },
+      ]),
+    );
+
+    const result = await service.recoverStaleCampaignGenerations({ now });
+
+    expect(result).toEqual({ scanned: 1, requeued: 0, failed: 1 });
+    expect(campaignModel.updateOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _id: campaignId,
+        userId,
+        status: CampaignStatus.GENERATING,
+      }),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          status: CampaignStatus.FAILED,
+          generationError: expect.stringContaining('metadata is missing'),
+          failedAt: now,
+        }),
+        $unset: { generationAttemptId: '', generationLockedAt: '' },
+      }),
+    );
+    expect(campaignGenerationQueue.add).not.toHaveBeenCalled();
+  });
+
+  it('marks stale generation failed when automatic attempts are exhausted', async () => {
+    const now = new Date('2026-07-01T00:00:00.000Z');
+    const campaignId = new Types.ObjectId();
+    campaignModel.find.mockReturnValueOnce(
+      query([
+        {
+          _id: campaignId,
+          userId,
+          status: CampaignStatus.GENERATING,
+          generationAttemptId: 'old-attempt',
+          generationLockedAt: new Date(now.getTime() - 20 * 60 * 1000),
+          generationAttempts: 3,
+          generationRequest: makeGenerationRequest(),
+        },
+      ]),
+    );
+
+    const result = await service.recoverStaleCampaignGenerations({ now });
+
+    expect(result).toEqual({ scanned: 1, requeued: 0, failed: 1 });
+    expect(campaignModel.updateOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _id: campaignId,
+        userId,
+        status: CampaignStatus.GENERATING,
+        generationAttemptId: 'old-attempt',
+      }),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          status: CampaignStatus.FAILED,
+          generationError: expect.stringContaining('stalled after 3 attempts'),
+          failedAt: now,
+        }),
+      }),
+    );
+    expect(campaignGenerationQueue.add).not.toHaveBeenCalled();
+  });
+
+  it('marks recovery failed if the recovery queue add fails', async () => {
+    const now = new Date('2026-07-01T00:00:00.000Z');
+    const campaignId = new Types.ObjectId();
+    const stale = {
+      _id: campaignId,
+      userId,
+      status: CampaignStatus.GENERATING,
+      generationAttemptId: 'old-attempt',
+      generationLockedAt: new Date(now.getTime() - 20 * 60 * 1000),
+      generationAttempts: 1,
+      generationRequest: makeGenerationRequest(),
+    };
+    campaignModel.find.mockReturnValueOnce(query([stale]));
+    campaignModel.findOneAndUpdate.mockResolvedValueOnce({
+      ...stale,
+      generationAttemptId: 'new-attempt',
+    });
+    campaignGenerationQueue.add.mockRejectedValueOnce(new Error('redis unavailable'));
+
+    const result = await service.recoverStaleCampaignGenerations({ now });
+
+    expect(result).toEqual({ scanned: 1, requeued: 0, failed: 1 });
+    expect(campaignModel.updateOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _id: campaignId,
+        userId,
+        status: CampaignStatus.GENERATING,
+        generationAttemptId: expect.any(String),
+      }),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          status: CampaignStatus.FAILED,
+          generationError: 'Campaign generation recovery could not be queued',
+          failedAt: now,
+        }),
+        $unset: { generationAttemptId: '', generationLockedAt: '' },
+      }),
+    );
+  });
+
+  it('manual retry consumes quota and enqueues a fresh generation attempt', async () => {
+    const campaignId = new Types.ObjectId();
+    const campaign = makeCampaign(campaignId, new Types.ObjectId(), []);
+    campaign.status = CampaignStatus.FAILED;
+    campaign.generationRequest = makeGenerationRequest();
+    const generating = {
+      ...campaign,
+      status: CampaignStatus.GENERATING,
+      generationAttemptId: 'retry-attempt',
+    };
+    jest
+      .spyOn(service as any, 'requireCampaign')
+      .mockResolvedValueOnce(campaign)
+      .mockResolvedValueOnce(generating);
+    jest.spyOn(service as any, 'serializeCampaign').mockResolvedValue({
+      status: CampaignStatus.GENERATING,
+    });
+    campaignModel.findOneAndUpdate.mockResolvedValueOnce(generating);
+
+    const result = await service.retryGeneration(userId, String(campaignId));
+
+    expect(result).toEqual({ status: CampaignStatus.GENERATING });
+    expect(campaignModel.findOneAndUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _id: campaignId,
+        userId,
+        status: CampaignStatus.FAILED,
+        generationRequest: { $exists: true },
+      }),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          status: CampaignStatus.GENERATING,
+          generationAttemptId: expect.any(String),
+          generationLockedAt: expect.any(Date),
+          generationAttempts: 1,
+        }),
+      }),
+      { new: true },
+    );
+    expect(llmQuotaUsageModel.findOneAndUpdate).toHaveBeenCalled();
+    expect(campaignGenerationQueue.add).toHaveBeenCalledWith(
+      CAMPAIGN_GENERATION_JOB,
+      expect.objectContaining({
+        campaignId: String(campaignId),
+        userId,
+        generationAttemptId: expect.any(String),
+      }),
+      expect.objectContaining({ removeOnFail: false }),
+    );
+  });
+
+  it('debug simulation marks a campaign as a stale claimed generation without queueing', async () => {
+    const campaignId = new Types.ObjectId();
+    const contactId = new Types.ObjectId();
+    const campaign = makeCampaign(campaignId, contactId);
+    const updated = {
+      ...campaign,
+      status: CampaignStatus.GENERATING,
+      generationAttemptId: 'debug-attempt',
+    };
+    jest.spyOn(service as any, 'requireCampaign').mockResolvedValue(campaign);
+    jest.spyOn(service as any, 'findDefaultCampaignTemplate').mockResolvedValue({
+      _id: new Types.ObjectId(),
+      defaultMaxSteps: 3,
+      steps: [{ order: 1 }],
+    });
+    jest.spyOn(service as any, 'serializeCampaign').mockResolvedValue({
+      status: CampaignStatus.GENERATING,
+      generationError: 'Debug: simulated worker crash after generation claim',
+    });
+    contactsService.findOwnedByIds.mockResolvedValue([
+      { _id: contactId, name: 'Ada Lovelace', email: 'ada@example.com' },
+    ]);
+    campaignModel.findOneAndUpdate.mockResolvedValueOnce(updated);
+
+    const result = await service.debugSimulateGenerationWorkerCrash(
+      userId,
+      String(campaignId),
+    );
+
+    expect(result).toEqual({
+      status: CampaignStatus.GENERATING,
+      generationError: 'Debug: simulated worker crash after generation claim',
+    });
+    expect(campaignModel.findOneAndUpdate).toHaveBeenCalledWith(
+      { _id: campaignId, userId },
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          status: CampaignStatus.GENERATING,
+          sequenceSteps: [],
+          generationAttemptId: expect.stringMatching(/^debug-/),
+          generationLockedAt: expect.any(Date),
+          generationAttempts: 1,
+          generationRequest: expect.objectContaining({
+            name: 'Founder outreach',
+            groupIds: [],
+            contactIds: [String(contactId)],
+          }),
+          generationError: 'Debug: simulated worker crash after generation claim',
+        }),
+        $unset: { failedAt: '' },
+      }),
+      { new: true },
+    );
+    expect(campaignGenerationQueue.add).not.toHaveBeenCalled();
+    expect(llmQuotaUsageModel.findOneAndUpdate).not.toHaveBeenCalled();
+  });
+
+  it('debug recovery trigger runs stale generation recovery and returns the campaign', async () => {
+    const campaignId = new Types.ObjectId();
+    const campaign = makeCampaign(campaignId, new Types.ObjectId());
+    jest
+      .spyOn(service as any, 'requireCampaign')
+      .mockResolvedValueOnce(campaign);
+    jest.spyOn(service, 'recoverStaleCampaignGenerations').mockResolvedValue({
+      scanned: 1,
+      requeued: 1,
+      failed: 0,
+    });
+    jest.spyOn(service as any, 'serializeCampaign').mockResolvedValue({
+      _id: String(campaignId),
+    });
+
+    const result = await service.debugRecoverGeneration(userId, String(campaignId));
+
+    expect(service.recoverStaleCampaignGenerations).toHaveBeenCalledWith({
+      userId,
+      campaignId: String(campaignId),
+      limit: 1,
+    });
+    expect(result).toEqual({
+      recovery: { scanned: 1, requeued: 1, failed: 0 },
+      campaign: { _id: String(campaignId) },
+    });
   });
 
   it('marks a campaign failed when launch side effects fail after claim', async () => {
@@ -946,6 +1450,100 @@ describe('CampaignsService workflow hardening', () => {
     expect(sequenceQueue.add).not.toHaveBeenCalled();
   });
 
+  it('updates one draft sequence step without replacing the whole campaign flow', async () => {
+    const campaignId = new Types.ObjectId();
+    const contactId = new Types.ObjectId();
+    const campaign = makeCampaign(campaignId, contactId);
+    campaign.sequenceSteps = [
+      ...campaign.sequenceSteps,
+      {
+        stepId: 'step-2',
+        order: 2,
+        delayMinutes: 4320,
+        subjectTemplate: 'Following up on {{company}}',
+        promptTemplate: 'Hi {{first_name}}, following up about {{company}}.',
+      },
+    ];
+    const updated = makeCampaign(campaignId, contactId);
+    updated.sequenceSteps = [
+      campaign.sequenceSteps[0],
+      {
+        ...campaign.sequenceSteps[1],
+        subjectTemplate: 'Quick follow-up for {{company}}',
+        promptTemplate: '<p>Hi {{first_name}}, still worth a look at {{company}}?</p>',
+      },
+    ];
+    updated.promptTemplate = updated.sequenceSteps[0].promptTemplate;
+
+    jest.spyOn(service as any, 'requireCampaign').mockResolvedValue(campaign);
+    campaignModel.findOneAndUpdate.mockResolvedValueOnce(updated);
+    contactsService.findOwnedByIds.mockResolvedValue([]);
+
+    const result = await service.updateSequenceStep(userId, String(campaignId), 'step-2', {
+      subjectTemplate: 'Quick follow-up for {{company}}',
+      promptTemplate: '<p>Hi {{first_name}}, still worth a look at {{company}}?</p>',
+    });
+
+    expect(campaignModel.findOneAndUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _id: campaignId,
+        userId,
+        'sequenceSteps.stepId': 'step-2',
+      }),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          sequenceSteps: expect.arrayContaining([
+            expect.objectContaining({
+              stepId: 'step-2',
+              subjectTemplate: 'Quick follow-up for {{company}}',
+              promptTemplate:
+                '<p>Hi {{first_name}}, still worth a look at {{company}}?</p>',
+            }),
+          ]),
+        }),
+      }),
+      { new: true },
+    );
+    expect(result.sequenceSteps[1]).toMatchObject({
+      stepId: 'step-2',
+      subjectTemplate: 'Quick follow-up for {{company}}',
+    });
+  });
+
+  it('returns one regenerated sequence step proposal without mutating the campaign', async () => {
+    const campaignId = new Types.ObjectId();
+    const contactId = new Types.ObjectId();
+    const campaign = makeCampaign(campaignId, contactId);
+
+    jest.spyOn(service as any, 'requireCampaign').mockResolvedValue(campaign);
+    llm.complete.mockResolvedValue(
+      JSON.stringify({
+        subjectTemplate: 'Fresh idea for {{company}}',
+        promptTemplate: 'Hi {{first_name}}, a sharper idea for {{company}}.',
+      }),
+    );
+
+    const result = await service.regenerateSequenceStep(
+      userId,
+      String(campaignId),
+      'step-1',
+    );
+
+    expect(llm.complete).toHaveBeenCalledWith(
+      expect.stringContaining('Regenerate exactly one outreach sequence email step.'),
+    );
+    expect(campaignModel.findOneAndUpdate).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      step: expect.objectContaining({
+        stepId: 'step-1',
+        order: 1,
+        delayMinutes: 0,
+        subjectTemplate: 'Fresh idea for {{company}}',
+        promptTemplate: 'Hi {{first_name}}, a sharper idea for {{company}}.',
+      }),
+    });
+  });
+
   it('keeps safe validation errors for direct generation failures', async () => {
     const campaignId = new Types.ObjectId();
     const contactId = new Types.ObjectId();
@@ -991,7 +1589,7 @@ function makeCampaign(
     },
   ],
 ) {
-  return {
+  const campaign: any = {
     _id: campaignId,
     userId: 'user-1',
     name: 'Founder outreach',
@@ -1010,25 +1608,33 @@ function makeCampaign(
       },
     ],
     save: jest.fn(),
-    toObject: jest.fn().mockReturnValue({
-      _id: campaignId,
-      userId: 'user-1',
-      name: 'Founder outreach',
-      status: CampaignStatus.DRAFT,
-      promptTemplate: 'Hi {{first_name}}, quick idea for {{company}}.',
-      directContactIds: [contactId],
-      targetGroupIds: [],
-      contacts,
-      sequenceSteps: [
-        {
-          stepId: 'step-1',
-          order: 1,
-          delayMinutes: 0,
-          subjectTemplate: 'Idea for {{company}}',
-          promptTemplate: 'Hi {{first_name}}, quick idea for {{company}}.',
-        },
-      ],
-    }),
+    toObject: jest.fn(),
+  };
+  campaign.toObject.mockImplementation(() => ({
+    _id: campaign._id,
+    userId: campaign.userId,
+    name: campaign.name,
+    status: campaign.status,
+    promptTemplate: campaign.promptTemplate,
+    directContactIds: campaign.directContactIds,
+    targetGroupIds: campaign.targetGroupIds,
+    contacts: campaign.contacts,
+    sequenceSteps: campaign.sequenceSteps,
+    generationError: campaign.generationError,
+  }));
+  return campaign;
+}
+
+function makeGenerationRequest() {
+  return {
+    name: 'Generated sequence',
+    templateId: 'cold-intro',
+    goal: 'Book calls',
+    audienceDescription: 'Founders',
+    tone: 'direct',
+    maxSteps: 3,
+    groupIds: [],
+    contactIds: [],
   };
 }
 

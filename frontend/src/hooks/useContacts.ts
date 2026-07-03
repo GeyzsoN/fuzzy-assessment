@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   contactsApi,
   CreateContactBody,
@@ -25,12 +25,23 @@ export function useContacts(initial: ListContactsParams = {}) {
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
+  const requestSeqRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (options: { cancelPrevious?: boolean } = {}) => {
+    if (options.cancelPrevious) {
+      abortRef.current?.abort();
+    }
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const requestSeq = requestSeqRef.current + 1;
+    requestSeqRef.current = requestSeq;
+
     setLoading(true);
     setError(null);
     try {
-      const res = await contactsApi.list(params);
+      const res = await contactsApi.list(params, { signal: controller.signal });
+      if (requestSeq !== requestSeqRef.current) return;
       setData({
         items: res.items,
         total: res.total,
@@ -38,14 +49,26 @@ export function useContacts(initial: ListContactsParams = {}) {
         limit: res.limit,
       });
     } catch (e) {
+      if (controller.signal.aborted || requestSeq !== requestSeqRef.current) {
+        return;
+      }
       setError(e instanceof ApiError ? e.message : 'Failed to load contacts');
     } finally {
-      setLoading(false);
+      if (requestSeq === requestSeqRef.current) {
+        setLoading(false);
+        if (abortRef.current === controller) {
+          abortRef.current = null;
+        }
+      }
     }
   }, [params]);
 
   useEffect(() => {
-    load();
+    load({ cancelPrevious: true });
+
+    return () => {
+      abortRef.current?.abort();
+    };
   }, [load]);
 
   const createContact = useCallback(

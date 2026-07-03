@@ -1,6 +1,6 @@
 'use client';
 
-import React, { Suspense, useState, useEffect, useCallback } from 'react';
+import React, { Suspense, useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import {
   RefreshCw,
@@ -14,9 +14,12 @@ import {
   ArrowUpDown,
 } from 'lucide-react';
 import Shell from '@/components/shell';
+import RequireAuth from '@/components/require-auth';
 import { useContacts } from '@/hooks/useContacts';
+import { formatCount } from '@/lib/format';
 
 const DEFAULT_LIMIT = 10;
+const SEARCH_DEBOUNCE_MS = 300;
 const ALLOWED_LIMITS = [10, 20, 50];
 type ContactSort = 'name' | 'email' | 'company' | 'createdAt';
 type ContactSortDirection = 'asc' | 'desc';
@@ -48,6 +51,22 @@ function readSortDirection(
   return value === 'asc' || value === 'desc' ? value : defaultSortDirection(sort);
 }
 
+function useDebouncedValue<T>(value: T, delayMs: number) {
+  const [debouncedValue, setDebouncedValue] = useState(value);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      setDebouncedValue(value);
+    }, delayMs);
+
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [delayMs, value]);
+
+  return debouncedValue;
+}
+
 function ContactsSortIcon({
   activeSort,
   activeDirection,
@@ -70,9 +89,11 @@ function ContactsSortIcon({
 
 export default function ContactsPage() {
   return (
-    <Suspense fallback={<Shell><div className="text-sm text-slate-500">Loading contacts...</div></Shell>}>
-      <ContactsPageContent />
-    </Suspense>
+    <RequireAuth loadingLabel="Checking contact access...">
+      <Suspense fallback={<Shell><div className="text-sm text-slate-500">Loading contacts...</div></Shell>}>
+        <ContactsPageContent />
+      </Suspense>
+    </RequireAuth>
   );
 }
 
@@ -91,6 +112,8 @@ function ContactsPageContent() {
 
   // Search and Pagination
   const [searchQuery, setSearchQuery] = useState(activeSearch);
+  const debouncedSearchQuery = useDebouncedValue(searchQuery, SEARCH_DEBOUNCE_MS);
+  const searchEditedRef = useRef(false);
 
   // New Contact Form
   const [name, setName] = useState('');
@@ -129,13 +152,16 @@ function ContactsPageContent() {
   const pageCount = Math.max(1, Math.ceil(totalCount / (data?.limit || urlLimit)));
 
   const updateListUrl = useCallback(
-    (next: {
-      page?: number;
-      limit?: number;
-      search?: string;
-      sort?: ContactSort;
-      direction?: ContactSortDirection;
-    }) => {
+    (
+      next: {
+        page?: number;
+        limit?: number;
+        search?: string;
+        sort?: ContactSort;
+        direction?: ContactSortDirection;
+      },
+      mode: 'push' | 'replace' = 'push',
+    ) => {
       const params = new URLSearchParams(searchParams.toString());
       const nextPage = next.page ?? urlPage;
       const nextLimit = next.limit ?? urlLimit;
@@ -153,7 +179,12 @@ function ContactsPageContent() {
         params.delete('search');
       }
 
-      router.push(`/contacts?${params.toString()}`, { scroll: false });
+      const nextUrl = `/contacts?${params.toString()}`;
+      if (mode === 'replace') {
+        router.replace(nextUrl, { scroll: false });
+      } else {
+        router.push(nextUrl, { scroll: false });
+      }
     },
     [activeDirection, activeSearch, activeSort, router, searchParams, urlLimit, urlPage],
   );
@@ -186,7 +217,17 @@ function ContactsPageContent() {
 
   useEffect(() => {
     setSearchQuery(activeSearch);
+    searchEditedRef.current = false;
   }, [activeSearch]);
+
+  useEffect(() => {
+    if (!searchEditedRef.current) return;
+
+    const nextSearch = debouncedSearchQuery.trim();
+    if (nextSearch === activeSearch.trim()) return;
+
+    updateListUrl({ page: 1, search: nextSearch }, 'replace');
+  }, [activeSearch, debouncedSearchQuery, updateListUrl]);
 
   useEffect(() => {
     setParams({
@@ -200,6 +241,7 @@ function ContactsPageContent() {
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    searchEditedRef.current = false;
     updateListUrl({ page: 1, search: searchQuery });
   };
 
@@ -403,7 +445,10 @@ function ContactsPageContent() {
               <input
                 type="text"
                 value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
+                onChange={(e) => {
+                  searchEditedRef.current = true;
+                  setSearchQuery(e.target.value);
+                }}
                 placeholder="Search by name, email, company, title..."
                 className="w-full pl-10 pr-4 py-2.5 border border-slate-200 bg-white rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all shadow-sm"
               />
@@ -539,7 +584,7 @@ function ContactsPageContent() {
           {!loading && pageCount > 1 && (
             <div className="flex items-center justify-between border-t border-slate-200 pt-5">
               <div className="text-xs text-slate-400 font-medium">
-                Showing page <span className="text-slate-700 font-semibold">{page}</span> of <span className="text-slate-700 font-semibold">{pageCount}</span> ({totalCount} total contacts)
+                Showing page <span className="text-slate-700 font-semibold">{page}</span> of <span className="text-slate-700 font-semibold">{pageCount}</span> ({formatCount(totalCount, 'contact')} total)
               </div>
               <div className="flex items-center space-x-2">
                 <select

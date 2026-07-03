@@ -97,6 +97,7 @@ export interface Campaign {
   name: string;
   status: 'draft' | 'generating' | 'launching' | 'running' | 'completed' | 'failed';
   generationError: string | null;
+  canRetryGeneration?: boolean;
   targetGroupIds: string[];
   targetContactIds: string[];
   sequenceSteps: SequenceStep[];
@@ -130,6 +131,15 @@ export interface ContactGeneration {
 export interface CampaignOutboxData {
   outbox: OutboxRow[];
   generations: Record<string, ContactGeneration>;
+}
+
+export interface GenerationRecoveryDebugResult {
+  recovery: {
+    scanned: number;
+    requeued: number;
+    failed: number;
+  };
+  campaign: Campaign;
 }
 
 export interface IdempotencyOptions {
@@ -322,6 +332,73 @@ export const campaignsService = {
     return mapCampaign(campaign);
   },
 
+  async retryGeneration(campaignId: string): Promise<Campaign> {
+    const campaign = await request<BackendCampaign>(
+      `/campaigns/${campaignId}/retry-generation`,
+      { method: 'POST' },
+    );
+    return mapCampaign(campaign);
+  },
+
+  async debugSimulateGenerationWorkerCrash(
+    campaignId: string,
+  ): Promise<Campaign> {
+    const campaign = await request<BackendCampaign>(
+      `/campaigns/${campaignId}/debug/simulate-generation-worker-crash`,
+      { method: 'POST' },
+    );
+    return mapCampaign(campaign);
+  },
+
+  async debugRecoverGeneration(
+    campaignId: string,
+  ): Promise<GenerationRecoveryDebugResult> {
+    const result = await request<{
+      recovery: GenerationRecoveryDebugResult['recovery'];
+      campaign: BackendCampaign;
+    }>(`/campaigns/${campaignId}/debug/recover-generation`, {
+      method: 'POST',
+    });
+    return {
+      recovery: result.recovery,
+      campaign: mapCampaign(result.campaign),
+    };
+  },
+
+  async updateSequenceStep(
+    campaignId: string,
+    stepId: string,
+    data: Partial<SequenceStep>,
+  ): Promise<Campaign> {
+    const campaign = await request<BackendCampaign>(
+      `/campaigns/${campaignId}/sequence-steps/${encodeURIComponent(stepId)}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({
+          delayMinutes: data.delayMinutes,
+          subjectTemplate: data.subjectTemplate,
+          promptTemplate: data.promptTemplate,
+        }),
+      },
+    );
+    return mapCampaign(campaign);
+  },
+
+  async regenerateSequenceStep(
+    campaignId: string,
+    stepId: string,
+    instructions?: string,
+  ): Promise<SequenceStep> {
+    const result = await request<{ step: SequenceStep }>(
+      `/campaigns/${campaignId}/sequence-steps/${encodeURIComponent(stepId)}/regenerate`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ instructions: instructions || undefined }),
+      },
+    );
+    return result.step;
+  },
+
   async delete(id: string): Promise<{ success: boolean }> {
     return request<{ success: boolean }>(`/campaigns/${id}`, {
       method: 'DELETE',
@@ -503,6 +580,7 @@ interface BackendCampaign {
   name: string;
   status?: Campaign['status'];
   generationError?: string;
+  canRetryGeneration?: boolean;
   promptTemplate?: string;
   targetGroupIds?: string[];
   directContactIds?: string[];
@@ -576,6 +654,7 @@ function mapCampaign(campaign: BackendCampaign): Campaign {
     name: campaign.name,
     status: campaign.status || 'draft',
     generationError: campaign.generationError || null,
+    canRetryGeneration: Boolean(campaign.canRetryGeneration),
     targetGroupIds: campaign.targetGroupIds || [],
     targetContactIds: campaign.directContactIds || [],
     sequenceSteps: campaign.sequenceSteps || [],

@@ -14,6 +14,10 @@ import { CreateCampaignDto } from './dtos/create-campaign.dto';
 import { UpdateCampaignDto } from './dtos/update-campaign.dto';
 import { AttachContactsDto } from './dtos/attach-contacts.dto';
 import { GenerateCampaignDraftDto } from './dtos/generate-campaign-draft.dto';
+import {
+  RegenerateSequenceStepDto,
+  UpdateSequenceStepDto,
+} from './dtos/update-sequence-step.dto';
 import { UserGuard } from '../../shared/auth/user.guard';
 import { CurrentUser } from '../../shared/auth/current-user.decorator';
 
@@ -72,6 +76,47 @@ export class CampaignsController {
   @Post(':id/generate-sequence')
   generateSequence(@CurrentUser() userId: string, @Param('id') id: string) {
     return this.campaignsService.generateSequence(userId, id);
+  }
+
+  @Post(':id/retry-generation')
+  retryGeneration(@CurrentUser() userId: string, @Param('id') id: string) {
+    return this.campaignsService.retryGeneration(userId, id);
+  }
+
+  @Post(':id/debug/simulate-generation-worker-crash')
+  debugSimulateGenerationWorkerCrash(
+    @CurrentUser() userId: string,
+    @Param('id') id: string,
+  ) {
+    return this.campaignsService.debugSimulateGenerationWorkerCrash(userId, id);
+  }
+
+  @Post(':id/debug/recover-generation')
+  debugRecoverGeneration(
+    @CurrentUser() userId: string,
+    @Param('id') id: string,
+  ) {
+    return this.campaignsService.debugRecoverGeneration(userId, id);
+  }
+
+  @Patch(':id/sequence-steps/:stepId')
+  updateSequenceStep(
+    @CurrentUser() userId: string,
+    @Param('id') id: string,
+    @Param('stepId') stepId: string,
+    @Body() dto: UpdateSequenceStepDto,
+  ) {
+    return this.campaignsService.updateSequenceStep(userId, id, stepId, dto);
+  }
+
+  @Post(':id/sequence-steps/:stepId/regenerate')
+  regenerateSequenceStep(
+    @CurrentUser() userId: string,
+    @Param('id') id: string,
+    @Param('stepId') stepId: string,
+    @Body() dto: RegenerateSequenceStepDto,
+  ) {
+    return this.campaignsService.regenerateSequenceStep(userId, id, stepId, dto);
   }
 
   @Get(':id/outbox')

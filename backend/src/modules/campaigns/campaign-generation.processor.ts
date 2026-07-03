@@ -6,6 +6,7 @@ import { GenerateCampaignDraftDto } from './dtos/generate-campaign-draft.dto';
 import {
   CAMPAIGN_GENERATION_JOB,
   CAMPAIGN_GENERATION_QUEUE,
+  CAMPAIGN_GENERATION_RECOVERY_JOB,
 } from './sequence-queue.constants';
 
 @Processor(CAMPAIGN_GENERATION_QUEUE, { concurrency: 2 })
@@ -21,8 +22,14 @@ export class CampaignGenerationProcessor extends WorkerHost {
       userId: string;
       campaignId: string;
       dto: GenerateCampaignDraftDto;
+      generationAttemptId?: string;
     }>,
   ) {
+    if (job.name === CAMPAIGN_GENERATION_RECOVERY_JOB) {
+      await this.campaignsService.recoverStaleCampaignGenerations();
+      return;
+    }
+
     if (job.name !== CAMPAIGN_GENERATION_JOB) {
       return;
     }

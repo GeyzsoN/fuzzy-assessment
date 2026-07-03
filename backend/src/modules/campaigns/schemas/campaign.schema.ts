@@ -65,6 +65,35 @@ export class CampaignContact {
 }
 export const CampaignContactSchema = SchemaFactory.createForClass(CampaignContact);
 
+@Schema({ _id: false })
+export class CampaignGenerationRequest {
+  @Prop({ required: true })
+  name: string;
+
+  @Prop({ required: true })
+  templateId: string;
+
+  @Prop({ required: true })
+  goal: string;
+
+  @Prop({ required: true })
+  audienceDescription: string;
+
+  @Prop()
+  tone?: string;
+
+  @Prop()
+  maxSteps?: number;
+
+  @Prop({ type: [String], default: [] })
+  groupIds: string[];
+
+  @Prop({ type: [String], default: [] })
+  contactIds: string[];
+}
+export const CampaignGenerationRequestSchema =
+  SchemaFactory.createForClass(CampaignGenerationRequest);
+
 @Schema({ timestamps: true })
 export class Campaign {
   @Prop({ required: true, index: true })
@@ -111,6 +140,18 @@ export class Campaign {
   failedAt?: Date;
 
   @Prop()
+  generationAttemptId?: string;
+
+  @Prop()
+  generationLockedAt?: Date;
+
+  @Prop({ default: 0 })
+  generationAttempts?: number;
+
+  @Prop({ type: CampaignGenerationRequestSchema })
+  generationRequest?: CampaignGenerationRequest;
+
+  @Prop()
   idempotencyScope?: string;
 
   @Prop()
@@ -125,6 +166,7 @@ export const CampaignSchema = SchemaFactory.createForClass(Campaign);
 
 CampaignSchema.index({ userId: 1, createdAt: -1, _id: 1 });
 CampaignSchema.index({ userId: 1, status: 1, createdAt: -1, _id: 1 });
+CampaignSchema.index({ status: 1, generationLockedAt: 1, _id: 1 });
 CampaignSchema.index(
   { userId: 1, idempotencyScope: 1, idempotencyKey: 1 },
   {

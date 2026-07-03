@@ -15,6 +15,7 @@ import { Model, Types } from 'mongoose';
 import {
   Campaign,
   CampaignDocument,
+  CampaignGenerationRequest,
   CampaignStatus,
   GenerationStatus,
   SequenceStep,
@@ -40,9 +41,19 @@ import { UpdateCampaignDto } from './dtos/update-campaign.dto';
 import { AttachContactsDto } from './dtos/attach-contacts.dto';
 import { GenerateCampaignDraftDto } from './dtos/generate-campaign-draft.dto';
 import {
+  RegenerateSequenceStepDto,
+  UpdateSequenceStepDto,
+} from './dtos/update-sequence-step.dto';
+import {
   CAMPAIGN_GENERATION_ATTEMPTS,
   CAMPAIGN_GENERATION_JOB,
+  CAMPAIGN_GENERATION_LEASE_MS,
+  CAMPAIGN_GENERATION_MAX_ATTEMPTS,
   CAMPAIGN_GENERATION_QUEUE,
+  CAMPAIGN_GENERATION_RECOVERY_BATCH_SIZE,
+  CAMPAIGN_GENERATION_RECOVERY_INTERVAL_MS,
+  CAMPAIGN_GENERATION_RECOVERY_JOB,
+  CAMPAIGN_GENERATION_RECOVERY_JOB_ID,
   DISPATCH_DUE_SEQUENCE_EMAILS_JOB,
   DISPATCH_DUE_SEQUENCE_EMAILS_JOB_ID,
   OUTBOX_DISPATCH_BATCH_SIZE,
@@ -59,10 +70,12 @@ import {
 } from './default-campaign-templates';
 import {
   buildCampaignDraftPrompt,
+  buildSequenceStepRegenerationPrompt,
   clampMaxSteps,
   hydrateContactPlaceholders,
   normalizeSequenceSteps,
   parseCampaignDraftResponse,
+  parseSequenceStepRegenerationResponse,
 } from './campaign-generation.helpers';
 import { ContactsService } from '../contacts/contacts.service';
 import { GroupsService } from '../groups/groups.service';
@@ -88,6 +101,32 @@ type IdempotencyContext = {
   scope: string;
   key: string;
   fingerprint: string;
+};
+
+type StoredCampaignGenerationRequest = Pick<
+  CampaignGenerationRequest,
+  | 'name'
+  | 'templateId'
+  | 'goal'
+  | 'audienceDescription'
+  | 'tone'
+  | 'maxSteps'
+  | 'groupIds'
+  | 'contactIds'
+>;
+
+type CampaignGenerationJobData = {
+  userId: string;
+  campaignId: string;
+  dto: GenerateCampaignDraftDto;
+  generationAttemptId: string;
+};
+
+type RecoverStaleCampaignGenerationsOptions = {
+  userId?: string;
+  campaignId?: string;
+  now?: Date;
+  limit?: number;
 };
 
 const OUTBOX_PROCESSING_STALE_MS = 10 * 60 * 1000;
@@ -131,6 +170,7 @@ export class CampaignsService implements OnModuleInit {
   async onModuleInit() {
     await this.seedManagedTemplates();
     await this.scheduleDueOutboxDispatcher();
+    await this.scheduleCampaignGenerationRecoveryDispatcher();
   }
 
   async listTemplates(): Promise<any[]> {
@@ -169,6 +209,10 @@ export class CampaignsService implements OnModuleInit {
       throw new BadRequestException('Campaign generation prompt is not configured');
     }
 
+    const generationAttemptId = new Types.ObjectId().toHexString();
+    const generationLockedAt = new Date();
+    const generationRequest = buildStoredGenerationRequest(dto);
+
     let campaign: CampaignDocument;
     try {
       campaign = await this.campaignModel.create({
@@ -179,6 +223,11 @@ export class CampaignsService implements OnModuleInit {
         directContactIds: toObjectIds(dto.contactIds || [], 'contact'),
         sequenceSteps: [],
         contacts: makeCampaignContacts(dto.contactIds || []),
+        generationAttemptId,
+        generationLockedAt,
+        generationAttempts: 1,
+        generationRequest,
+        lastAttemptedAt: generationLockedAt,
         ...(idempotency
           ? {
               idempotencyScope: idempotency.scope,
@@ -199,7 +248,12 @@ export class CampaignsService implements OnModuleInit {
       await this.consumeLlmQuota(userId, 'campaign-draft');
     } catch (error) {
       await this.campaignModel.updateOne(
-        { _id: campaign._id, userId, status: CampaignStatus.GENERATING },
+        {
+          _id: campaign._id,
+          userId,
+          status: CampaignStatus.GENERATING,
+          generationAttemptId,
+        },
         {
           $set: {
             status: CampaignStatus.FAILED,
@@ -207,33 +261,30 @@ export class CampaignsService implements OnModuleInit {
             failedAt: new Date(),
             lastAttemptedAt: new Date(),
           },
+          $unset: { generationAttemptId: '', generationLockedAt: '' },
         },
       );
       throw error;
     }
 
     try {
-      await this.campaignGenerationQueue.add(
-        CAMPAIGN_GENERATION_JOB,
-        {
-          userId,
-          campaignId: String(campaign._id),
-          dto,
-        },
-        {
-          jobId: makeBullJobId(CAMPAIGN_GENERATION_JOB, String(campaign._id)),
-          attempts: CAMPAIGN_GENERATION_ATTEMPTS,
-          backoff: { type: 'exponential', delay: QUEUE_BACKOFF_DELAY_MS },
-          removeOnComplete: QUEUE_REMOVE_ON_COMPLETE,
-          removeOnFail: false,
-        },
+      await this.enqueueCampaignGeneration(
+        userId,
+        String(campaign._id),
+        dto,
+        generationAttemptId,
       );
       this.logger.log(
-        `Queued campaign draft generation campaignId=${String(campaign._id)} userId=${userId}`,
+        `Queued campaign draft generation campaignId=${String(campaign._id)} userId=${userId} attemptId=${generationAttemptId}`,
       );
     } catch (error) {
       await this.campaignModel.updateOne(
-        { _id: campaign._id, userId, status: CampaignStatus.GENERATING },
+        {
+          _id: campaign._id,
+          userId,
+          status: CampaignStatus.GENERATING,
+          generationAttemptId,
+        },
         {
           $set: {
             status: CampaignStatus.FAILED,
@@ -244,6 +295,7 @@ export class CampaignsService implements OnModuleInit {
             failedAt: new Date(),
             lastAttemptedAt: new Date(),
           },
+          $unset: { generationAttemptId: '', generationLockedAt: '' },
         },
       );
       this.logger.error(
@@ -260,29 +312,48 @@ export class CampaignsService implements OnModuleInit {
     userId: string;
     campaignId: string;
     dto: GenerateCampaignDraftDto;
+    generationAttemptId?: string;
   }): Promise<void> {
+    if (!input.generationAttemptId) {
+      this.logger.warn(
+        `Skipped campaign draft generation without attemptId campaignId=${input.campaignId} userId=${input.userId}`,
+      );
+      return;
+    }
+
     const campaign = await this.requireCampaign(input.userId, input.campaignId);
     if (campaign.status === CampaignStatus.DRAFT) {
       return;
     }
-    if (
-      campaign.status !== CampaignStatus.GENERATING &&
-      campaign.status !== CampaignStatus.FAILED
-    ) {
-      throw new BadRequestException('Campaign is not pending generation');
+    if (campaign.status !== CampaignStatus.GENERATING) {
+      return;
+    }
+    if (campaign.generationAttemptId !== input.generationAttemptId) {
+      this.logger.warn(
+        `Skipped stale campaign draft generation campaignId=${String(campaign._id)} userId=${input.userId} attemptId=${input.generationAttemptId}`,
+      );
+      return;
     }
     assertCampaignTransition(campaign.status, CampaignStatus.GENERATING);
 
-    await this.campaignModel.updateOne(
-      { _id: campaign._id, userId: input.userId },
+    const claimed = await this.campaignModel.updateOne(
+      {
+        _id: campaign._id,
+        userId: input.userId,
+        status: CampaignStatus.GENERATING,
+        generationAttemptId: input.generationAttemptId,
+      },
       {
         $set: {
-          status: CampaignStatus.GENERATING,
           lastAttemptedAt: new Date(),
+          generationLockedAt: new Date(),
         },
-        $unset: { generationError: '', failedAt: '' },
+        $unset: { failedAt: '' },
       },
     );
+    if (updateMatchedCount(claimed) === 0) {
+      return;
+    }
 
     try {
       const campaignTemplate = await this.findCampaignTemplate(input.dto.templateId);
@@ -314,8 +385,13 @@ export class CampaignsService implements OnModuleInit {
       const llmResponse = await withTimeout(this.llm.complete(prompt), 20000);
       const sequenceSteps = parseCampaignDraftResponse(llmResponse, maxSteps);
 
-      await this.campaignModel.updateOne(
-        { _id: campaign._id, userId: input.userId },
+      const finished = await this.campaignModel.updateOne(
+        {
+          _id: campaign._id,
+          userId: input.userId,
+          status: CampaignStatus.GENERATING,
+          generationAttemptId: input.generationAttemptId,
+        },
         {
           $set: {
             status: CampaignStatus.DRAFT,
@@ -323,16 +399,34 @@ export class CampaignsService implements OnModuleInit {
             sequenceSteps,
             generatedAt: new Date(),
           },
-          $unset: { generationError: '', failedAt: '' },
+          $unset: {
+            generationError: '',
+            failedAt: '',
+            generationAttemptId: '',
+            generationLockedAt: '',
+            generationAttempts: '',
+            generationRequest: '',
+          },
         },
       );
+      if (updateMatchedCount(finished) === 0) {
+        this.logger.warn(
+          `Skipped stale campaign draft generation success campaignId=${String(campaign._id)} userId=${input.userId} attemptId=${input.generationAttemptId}`,
+        );
+        return;
+      }
       this.logger.log(
-        `Generated campaign draft campaignId=${String(campaign._id)} userId=${input.userId}`,
+        `Generated campaign draft campaignId=${String(campaign._id)} userId=${input.userId} attemptId=${input.generationAttemptId}`,
       );
     } catch (error) {
       const message = safeErrorMessage(error, 'Campaign draft generation failed');
-      await this.campaignModel.updateOne(
-        { _id: campaign._id, userId: input.userId },
+      const failed = await this.campaignModel.updateOne(
+        {
+          _id: campaign._id,
+          userId: input.userId,
+          status: CampaignStatus.GENERATING,
+          generationAttemptId: input.generationAttemptId,
+        },
         {
           $set: {
             status: CampaignStatus.FAILED,
@@ -340,10 +434,20 @@ export class CampaignsService implements OnModuleInit {
             failedAt: new Date(),
             lastAttemptedAt: new Date(),
           },
+          $unset: {
+            generationAttemptId: '',
+            generationLockedAt: '',
+          },
         },
       );
+      if (updateMatchedCount(failed) === 0) {
+        this.logger.warn(
+          `Skipped stale campaign draft generation failure campaignId=${String(campaign._id)} userId=${input.userId} attemptId=${input.generationAttemptId}`,
+        );
+        return;
+      }
       this.logger.error(
-        `Campaign draft generation failed campaignId=${String(campaign._id)} userId=${input.userId}`,
+        `Campaign draft generation failed campaignId=${String(campaign._id)} userId=${input.userId} attemptId=${input.generationAttemptId}`,
         error instanceof Error ? error.stack : undefined,
       );
       throw error;
@@ -437,6 +541,10 @@ export class CampaignsService implements OnModuleInit {
   }
 
   async list(userId: string): Promise<any[]> {
+    await this.recoverStaleCampaignGenerations({
+      userId,
+      limit: CAMPAIGN_GENERATION_RECOVERY_BATCH_SIZE,
+    });
     const campaigns = await this.campaignModel
       .find({ userId })
       .sort({ createdAt: -1, _id: 1 })
@@ -446,7 +554,15 @@ export class CampaignsService implements OnModuleInit {
   }
 
   async getOne(userId: string, campaignId: string): Promise<any> {
-    const campaign = await this.requireCampaign(userId, campaignId);
+    let campaign = await this.requireCampaign(userId, campaignId);
+    if (campaign.status === CampaignStatus.GENERATING) {
+      await this.recoverStaleCampaignGenerations({
+        userId,
+        campaignId,
+        limit: 1,
+      });
+      campaign = await this.requireCampaign(userId, campaignId);
+    }
     return this.serializeCampaign(userId, campaign);
   }
 
@@ -642,40 +758,12 @@ export class CampaignsService implements OnModuleInit {
     }
     assertCampaignTransition(campaign.status, CampaignStatus.GENERATING);
 
-    const campaignTemplate = await this.findDefaultCampaignTemplate();
-    const goal =
-      campaign.promptTemplate ||
-      campaign.sequenceSteps?.[0]?.promptTemplate ||
-      campaign.name;
-    const groupIds = (campaign.targetGroupIds || []).map((id) => String(id));
-    const contactIds = [
-      ...new Set([
-        ...(campaign.directContactIds || []).map((id) => String(id)),
-        ...(campaign.contacts || []).map((entry) => String(entry.contactId)),
-      ]),
-    ];
-
-    if (!groupIds.length && !contactIds.length) {
-      throw new BadRequestException(
-        'Select at least one group or contact before generating a sequence',
-      );
-    }
-
-    const requestedSteps = inferRequestedStepCount(goal);
-    const maxSteps = clampMaxSteps(
-      requestedSteps || Math.min(campaignTemplate.defaultMaxSteps || 3, 3),
-    );
-    const dto: GenerateCampaignDraftDto = {
-      name: campaign.name,
-      goal,
-      audienceDescription:
-        'Selected campaign audience. Keep contact values as placeholders.',
-      templateId: String(campaignTemplate._id),
-      tone: 'warm and direct',
-      maxSteps,
-      groupIds,
-      contactIds,
-    };
+    const dto = await this.buildGenerationDtoFromCampaign(campaign);
+    const groupIds = dto.groupIds || [];
+    const contactIds = dto.contactIds || [];
+    const generationAttemptId = new Types.ObjectId().toHexString();
+    const generationLockedAt = new Date();
+    const generationRequest = buildStoredGenerationRequest(dto);
 
     const claimed = await this.campaignModel.findOneAndUpdate(
       {
@@ -689,7 +777,11 @@ export class CampaignsService implements OnModuleInit {
           targetGroupIds: toObjectIds(groupIds, 'group'),
           directContactIds: toObjectIds(contactIds, 'contact'),
           sequenceSteps: [],
-          lastAttemptedAt: new Date(),
+          generationAttemptId,
+          generationLockedAt,
+          generationAttempts: 1,
+          generationRequest,
+          lastAttemptedAt: generationLockedAt,
         },
         $unset: { generationError: '', failedAt: '' },
       },
@@ -707,7 +799,12 @@ export class CampaignsService implements OnModuleInit {
       await this.consumeLlmQuota(userId, 'campaign-sequence');
     } catch (error) {
       await this.campaignModel.updateOne(
-        { _id: claimed._id, userId, status: CampaignStatus.GENERATING },
+        {
+          _id: claimed._id,
+          userId,
+          status: CampaignStatus.GENERATING,
+          generationAttemptId,
+        },
         {
           $set: {
             status: CampaignStatus.FAILED,
@@ -715,29 +812,30 @@ export class CampaignsService implements OnModuleInit {
             failedAt: new Date(),
             lastAttemptedAt: new Date(),
           },
+          $unset: { generationAttemptId: '', generationLockedAt: '' },
         },
       );
       throw error;
     }
 
     try {
-      await this.campaignGenerationQueue.add(
-        CAMPAIGN_GENERATION_JOB,
-        { userId, campaignId: String(claimed._id), dto },
-        {
-          jobId: makeBullJobId(CAMPAIGN_GENERATION_JOB, String(claimed._id)),
-          attempts: CAMPAIGN_GENERATION_ATTEMPTS,
-          backoff: { type: 'exponential', delay: QUEUE_BACKOFF_DELAY_MS },
-          removeOnComplete: QUEUE_REMOVE_ON_COMPLETE,
-          removeOnFail: false,
-        },
+      await this.enqueueCampaignGeneration(
+        userId,
+        String(claimed._id),
+        dto,
+        generationAttemptId,
       );
       this.logger.log(
-        `Queued campaign sequence generation campaignId=${String(claimed._id)} userId=${userId}`,
+        `Queued campaign sequence generation campaignId=${String(claimed._id)} userId=${userId} attemptId=${generationAttemptId}`,
       );
     } catch (error) {
       await this.campaignModel.updateOne(
-        { _id: claimed._id, userId, status: CampaignStatus.GENERATING },
+        {
+          _id: claimed._id,
+          userId,
+          status: CampaignStatus.GENERATING,
+          generationAttemptId,
+        },
         {
           $set: {
             status: CampaignStatus.FAILED,
@@ -748,6 +846,7 @@ export class CampaignsService implements OnModuleInit {
             failedAt: new Date(),
             lastAttemptedAt: new Date(),
           },
+          $unset: { generationAttemptId: '', generationLockedAt: '' },
         },
       );
       this.logger.error(
@@ -758,6 +857,324 @@ export class CampaignsService implements OnModuleInit {
     }
 
     return this.serializeCampaign(userId, claimed);
+  }
+
+  async retryGeneration(userId: string, campaignId: string): Promise<any> {
+    const campaign = await this.requireCampaign(userId, campaignId);
+    if (campaign.status !== CampaignStatus.FAILED) {
+      throw new BadRequestException('Only failed campaign generation can be retried');
+    }
+
+    const generationRequest = normalizeStoredGenerationRequest(
+      campaign.generationRequest,
+    );
+    if (!generationRequest) {
+      throw new BadRequestException(
+        'Campaign generation cannot be retried because recovery metadata is missing',
+      );
+    }
+
+    const dto = storedGenerationRequestToDto(generationRequest);
+    await this.validateTargets(userId, dto.groupIds || [], dto.contactIds || []);
+
+    const generationAttemptId = new Types.ObjectId().toHexString();
+    const generationLockedAt = new Date();
+    const claimed = await this.campaignModel.findOneAndUpdate(
+      {
+        _id: campaign._id,
+        userId,
+        status: CampaignStatus.FAILED,
+        generationRequest: { $exists: true },
+      },
+      {
+        $set: {
+          status: CampaignStatus.GENERATING,
+          generationAttemptId,
+          generationLockedAt,
+          generationAttempts: 1,
+          lastAttemptedAt: generationLockedAt,
+        },
+        $unset: { generationError: '', failedAt: '' },
+      },
+      { new: true },
+    );
+    if (!claimed) {
+      const latest = await this.requireCampaign(userId, campaignId);
+      if (latest.status === CampaignStatus.GENERATING) {
+        return this.serializeCampaign(userId, latest);
+      }
+      throw new BadRequestException('Only failed campaign generation can be retried');
+    }
+
+    try {
+      await this.consumeLlmQuota(userId, 'campaign-generation-retry');
+    } catch (error) {
+      await this.campaignModel.updateOne(
+        {
+          _id: claimed._id,
+          userId,
+          status: CampaignStatus.GENERATING,
+          generationAttemptId,
+        },
+        {
+          $set: {
+            status: CampaignStatus.FAILED,
+            generationError: safeErrorMessage(error, 'LLM quota exceeded'),
+            failedAt: new Date(),
+            lastAttemptedAt: new Date(),
+          },
+          $unset: { generationAttemptId: '', generationLockedAt: '' },
+        },
+      );
+      throw error;
+    }
+
+    try {
+      await this.enqueueCampaignGeneration(
+        userId,
+        String(claimed._id),
+        dto,
+        generationAttemptId,
+      );
+      this.logger.log(
+        `Retried campaign generation campaignId=${String(claimed._id)} userId=${userId} attemptId=${generationAttemptId}`,
+      );
+    } catch (error) {
+      await this.campaignModel.updateOne(
+        {
+          _id: claimed._id,
+          userId,
+          status: CampaignStatus.GENERATING,
+          generationAttemptId,
+        },
+        {
+          $set: {
+            status: CampaignStatus.FAILED,
+            generationError: safeErrorMessage(
+              error,
+              'Campaign generation retry could not be queued',
+            ),
+            failedAt: new Date(),
+            lastAttemptedAt: new Date(),
+          },
+          $unset: { generationAttemptId: '', generationLockedAt: '' },
+        },
+      );
+      this.logger.error(
+        `Failed to queue campaign generation retry campaignId=${String(claimed._id)} userId=${userId}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+      throw error;
+    }
+
+    const updated = await this.requireCampaign(userId, campaignId);
+    return this.serializeCampaign(userId, updated);
+  }
+
+  async debugSimulateGenerationWorkerCrash(
+    userId: string,
+    campaignId: string,
+  ): Promise<any> {
+    this.assertDebugWorkflowTriggersEnabled();
+    const campaign = await this.requireCampaign(userId, campaignId);
+    if (
+      campaign.status !== CampaignStatus.DRAFT &&
+      campaign.status !== CampaignStatus.FAILED &&
+      campaign.status !== CampaignStatus.GENERATING
+    ) {
+      throw new BadRequestException(
+        'Debug generation crash simulation is only available before launch',
+      );
+    }
+
+    const storedRequest = normalizeStoredGenerationRequest(
+      campaign.generationRequest,
+    );
+    const dto = storedRequest
+      ? storedGenerationRequestToDto(storedRequest)
+      : await this.buildGenerationDtoFromCampaign(campaign);
+    await this.validateTargets(userId, dto.groupIds || [], dto.contactIds || []);
+
+    const generationAttemptId = `debug-${new Types.ObjectId().toHexString()}`;
+    const generationLockedAt = new Date(
+      Date.now() - CAMPAIGN_GENERATION_LEASE_MS - 1000,
+    );
+    const updated = await this.campaignModel.findOneAndUpdate(
+      { _id: campaign._id, userId },
+      {
+        $set: {
+          status: CampaignStatus.GENERATING,
+          targetGroupIds: toObjectIds(dto.groupIds || [], 'group'),
+          directContactIds: toObjectIds(dto.contactIds || [], 'contact'),
+          sequenceSteps: [],
+          generationAttemptId,
+          generationLockedAt,
+          generationAttempts: 1,
+          generationRequest: buildStoredGenerationRequest(dto),
+          generationError: 'Debug: simulated worker crash after generation claim',
+          lastAttemptedAt: generationLockedAt,
+        },
+        $unset: { failedAt: '' },
+      },
+      { new: true },
+    );
+    if (!updated) {
+      throw new NotFoundException('Campaign not found');
+    }
+
+    this.logger.warn(
+      `Debug simulated campaign generation worker crash campaignId=${String(campaign._id)} userId=${userId} attemptId=${generationAttemptId}`,
+    );
+    return this.serializeCampaign(userId, updated);
+  }
+
+  async debugRecoverGeneration(
+    userId: string,
+    campaignId: string,
+  ): Promise<{ recovery: { scanned: number; requeued: number; failed: number }; campaign: any }> {
+    this.assertDebugWorkflowTriggersEnabled();
+    const recovery = await this.recoverStaleCampaignGenerations({
+      userId,
+      campaignId,
+      limit: 1,
+    });
+    const campaign = await this.requireCampaign(userId, campaignId);
+    return {
+      recovery,
+      campaign: await this.serializeCampaign(userId, campaign),
+    };
+  }
+
+  async updateSequenceStep(
+    userId: string,
+    campaignId: string,
+    stepId: string,
+    dto: UpdateSequenceStepDto,
+  ): Promise<any> {
+    if (
+      dto.delayMinutes === undefined &&
+      dto.subjectTemplate === undefined &&
+      dto.promptTemplate === undefined
+    ) {
+      throw new BadRequestException('At least one sequence step field is required');
+    }
+
+    const campaign = await this.requireCampaign(userId, campaignId);
+    this.assertSequenceTemplatesEditable(campaign.status);
+
+    const steps = normalizeSequenceSteps(
+      campaign.sequenceSteps,
+      campaign.promptTemplate,
+    );
+    const step = findSequenceStep(steps, stepId);
+    if (!step) {
+      throw new NotFoundException('Sequence step not found');
+    }
+
+    const updatedStep = {
+      ...step,
+      delayMinutes:
+        dto.delayMinutes !== undefined ? dto.delayMinutes : step.delayMinutes,
+      subjectTemplate:
+        dto.subjectTemplate !== undefined
+          ? dto.subjectTemplate.trim()
+          : step.subjectTemplate,
+      promptTemplate:
+        dto.promptTemplate !== undefined
+          ? dto.promptTemplate.trim()
+          : step.promptTemplate,
+    };
+    const nextSteps = normalizeSequenceSteps(
+      steps.map((entry) =>
+        entry.stepId === step.stepId ? updatedStep : entry,
+      ),
+      campaign.promptTemplate,
+    );
+
+    const updated = await this.campaignModel.findOneAndUpdate(
+      {
+        _id: campaign._id,
+        userId,
+        $or: [
+          { status: { $in: [CampaignStatus.DRAFT, CampaignStatus.FAILED] } },
+          { status: { $exists: false } },
+        ],
+        'sequenceSteps.stepId': step.stepId,
+      },
+      {
+        $set: {
+          sequenceSteps: nextSteps,
+          promptTemplate: nextSteps[0]?.promptTemplate,
+        },
+      },
+      { new: true },
+    );
+    if (!updated) {
+      throw new BadRequestException('Only draft campaigns can be edited');
+    }
+
+    this.logger.log(
+      `Updated sequence step campaignId=${String(campaign._id)} stepId=${step.stepId} userId=${userId}`,
+    );
+    return this.serializeCampaign(userId, updated);
+  }
+
+  async regenerateSequenceStep(
+    userId: string,
+    campaignId: string,
+    stepId: string,
+    dto: RegenerateSequenceStepDto = {},
+  ): Promise<{ step: SequenceStep }> {
+    const campaign = await this.requireCampaign(userId, campaignId);
+    this.assertSequenceTemplatesEditable(campaign.status);
+
+    const steps = normalizeSequenceSteps(
+      campaign.sequenceSteps,
+      campaign.promptTemplate,
+    );
+    const step = findSequenceStep(steps, stepId);
+    if (!step) {
+      throw new NotFoundException('Sequence step not found');
+    }
+
+    try {
+      await this.consumeLlmQuota(userId, 'sequence-step-regeneration');
+      const prompt = buildSequenceStepRegenerationPrompt({
+        campaignName: campaign.name,
+        campaignPrompt: campaign.promptTemplate,
+        step,
+        instructions: dto.instructions,
+      });
+      const llmOutput = await withTimeout(this.llm.complete(prompt), 12000);
+      const regeneratedStep = parseSequenceStepRegenerationResponse(
+        llmOutput,
+        step,
+      );
+
+      this.logger.log(
+        `Generated sequence step proposal campaignId=${String(campaign._id)} stepId=${step.stepId} userId=${userId}`,
+      );
+      return { step: regeneratedStep };
+    } catch (error) {
+      if (isTooManyRequestsError(error) || error instanceof ConflictException) {
+        throw error;
+      }
+      const message = safeErrorMessage(error, 'Sequence step regeneration failed');
+      await this.campaignModel.updateOne(
+        { _id: campaign._id, userId },
+        {
+          $set: {
+            generationError: message,
+            lastAttemptedAt: new Date(),
+          },
+        },
+      );
+      this.logger.error(
+        `Sequence step regeneration failed campaignId=${String(campaign._id)} stepId=${step.stepId} userId=${userId}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+      throw error;
+    }
   }
 
   async getOutbox(userId: string, campaignId: string): Promise<any[]> {
@@ -1152,6 +1569,168 @@ export class CampaignsService implements OnModuleInit {
     return { enqueued };
   }
 
+  async recoverStaleCampaignGenerations(
+    options: RecoverStaleCampaignGenerationsOptions = {},
+  ): Promise<{ scanned: number; requeued: number; failed: number }> {
+    const now = options.now || new Date();
+    const staleLockedBefore = new Date(
+      now.getTime() - CAMPAIGN_GENERATION_LEASE_MS,
+    );
+    const filter: any = {
+      status: CampaignStatus.GENERATING,
+      $or: [
+        { generationLockedAt: { $lte: staleLockedBefore } },
+        { generationLockedAt: { $exists: false } },
+        { generationAttemptId: { $exists: false } },
+        { generationRequest: { $exists: false } },
+      ],
+    };
+    if (options.userId) {
+      filter.userId = options.userId;
+    }
+    if (options.campaignId) {
+      filter._id = new Types.ObjectId(options.campaignId);
+    }
+
+    const campaigns = await this.campaignModel
+      .find(filter)
+      .sort({ generationLockedAt: 1, lastAttemptedAt: 1, _id: 1 })
+      .limit(options.limit || CAMPAIGN_GENERATION_RECOVERY_BATCH_SIZE)
+      .lean()
+      .exec();
+
+    let requeued = 0;
+    let failed = 0;
+    for (const campaign of campaigns as any[]) {
+      const generationRequest = normalizeStoredGenerationRequest(
+        campaign.generationRequest,
+      );
+      if (!campaign.generationAttemptId || !generationRequest) {
+        const result = await this.campaignModel.updateOne(
+          {
+            _id: campaign._id,
+            userId: campaign.userId,
+            status: CampaignStatus.GENERATING,
+          },
+          {
+            $set: {
+              status: CampaignStatus.FAILED,
+              generationError:
+                'Campaign generation recovery metadata is missing. Retry generation from the campaign page.',
+              failedAt: now,
+              lastAttemptedAt: now,
+            },
+            $unset: { generationAttemptId: '', generationLockedAt: '' },
+          },
+        );
+        if (updateMatchedCount(result) !== 0) {
+          failed += 1;
+          this.logger.warn(
+            `Marked campaign generation failed due missing recovery metadata campaignId=${String(campaign._id)} userId=${campaign.userId}`,
+          );
+        }
+        continue;
+      }
+
+      const attempts = Number(campaign.generationAttempts || 0);
+      if (attempts >= CAMPAIGN_GENERATION_MAX_ATTEMPTS) {
+        const result = await this.campaignModel.updateOne(
+          {
+            _id: campaign._id,
+            userId: campaign.userId,
+            status: CampaignStatus.GENERATING,
+            generationAttemptId: campaign.generationAttemptId,
+          },
+          {
+            $set: {
+              status: CampaignStatus.FAILED,
+              generationError: `Campaign generation stalled after ${CAMPAIGN_GENERATION_MAX_ATTEMPTS} attempts. Retry generation from the campaign page.`,
+              failedAt: now,
+              lastAttemptedAt: now,
+            },
+            $unset: { generationAttemptId: '', generationLockedAt: '' },
+          },
+        );
+        if (updateMatchedCount(result) !== 0) {
+          failed += 1;
+          this.logger.warn(
+            `Marked campaign generation failed after max attempts campaignId=${String(campaign._id)} userId=${campaign.userId} attempts=${attempts}`,
+          );
+        }
+        continue;
+      }
+
+      const nextAttemptId = new Types.ObjectId().toHexString();
+      const claimed = await this.campaignModel.findOneAndUpdate(
+        {
+          _id: campaign._id,
+          userId: campaign.userId,
+          status: CampaignStatus.GENERATING,
+          generationAttemptId: campaign.generationAttemptId,
+          $or: [
+            { generationLockedAt: { $lte: staleLockedBefore } },
+            { generationLockedAt: { $exists: false } },
+          ],
+        },
+        {
+          $set: {
+            generationAttemptId: nextAttemptId,
+            generationLockedAt: now,
+            generationError: 'Recovery attempt queued',
+            lastAttemptedAt: now,
+          },
+          $inc: { generationAttempts: 1 },
+          $unset: { failedAt: '' },
+        },
+        { new: true },
+      );
+      if (!claimed) {
+        continue;
+      }
+
+      try {
+        await this.enqueueCampaignGeneration(
+          campaign.userId,
+          String(campaign._id),
+          storedGenerationRequestToDto(generationRequest),
+          nextAttemptId,
+        );
+        requeued += 1;
+        this.logger.warn(
+          `Requeued stale campaign generation campaignId=${String(campaign._id)} userId=${campaign.userId} attemptId=${nextAttemptId} previousAttemptId=${campaign.generationAttemptId}`,
+        );
+      } catch (error) {
+        await this.campaignModel.updateOne(
+          {
+            _id: campaign._id,
+            userId: campaign.userId,
+            status: CampaignStatus.GENERATING,
+            generationAttemptId: nextAttemptId,
+          },
+          {
+            $set: {
+              status: CampaignStatus.FAILED,
+              generationError: safeErrorMessage(
+                error,
+                'Campaign generation recovery could not be queued',
+              ),
+              failedAt: now,
+              lastAttemptedAt: now,
+            },
+            $unset: { generationAttemptId: '', generationLockedAt: '' },
+          },
+        );
+        failed += 1;
+        this.logger.error(
+          `Failed to queue stale campaign generation recovery campaignId=${String(campaign._id)} userId=${campaign.userId}`,
+          error instanceof Error ? error.stack : undefined,
+        );
+      }
+    }
+
+    return { scanned: campaigns.length, requeued, failed };
+  }
+
   private async readCampaignContactResult(
     userId: string,
     campaignId: Types.ObjectId,
@@ -1307,6 +1886,18 @@ export class CampaignsService implements OnModuleInit {
     return campaign;
   }
 
+  private assertSequenceTemplatesEditable(status?: CampaignStatus) {
+    if (
+      status &&
+      status !== CampaignStatus.DRAFT &&
+      status !== CampaignStatus.FAILED
+    ) {
+      throw new BadRequestException(
+        'Sequence templates are locked after launch',
+      );
+    }
+  }
+
   private async findCampaignTemplate(templateId: string) {
     const filter = Types.ObjectId.isValid(templateId)
       ? { $or: [{ _id: new Types.ObjectId(templateId) }, { key: templateId }] }
@@ -1338,6 +1929,51 @@ export class CampaignsService implements OnModuleInit {
     return fallback;
   }
 
+  private async buildGenerationDtoFromCampaign(
+    campaign: CampaignDocument,
+  ): Promise<GenerateCampaignDraftDto> {
+    const campaignTemplate = await this.findDefaultCampaignTemplate();
+    const goal =
+      campaign.promptTemplate ||
+      campaign.sequenceSteps?.[0]?.promptTemplate ||
+      campaign.name;
+    const groupIds = (campaign.targetGroupIds || []).map((id) => String(id));
+    const contactIds = [
+      ...new Set([
+        ...(campaign.directContactIds || []).map((id) => String(id)),
+        ...(campaign.contacts || []).map((entry) => String(entry.contactId)),
+      ]),
+    ];
+
+    if (!groupIds.length && !contactIds.length) {
+      throw new BadRequestException(
+        'Select at least one group or contact before generating a sequence',
+      );
+    }
+
+    const requestedSteps = inferRequestedStepCount(goal);
+    const maxSteps = clampMaxSteps(
+      requestedSteps || Math.min(campaignTemplate.defaultMaxSteps || 3, 3),
+    );
+    return {
+      name: campaign.name,
+      goal,
+      audienceDescription:
+        'Selected campaign audience. Keep contact values as placeholders.',
+      templateId: String(campaignTemplate._id),
+      tone: 'warm and direct',
+      maxSteps,
+      groupIds,
+      contactIds,
+    };
+  }
+
+  private assertDebugWorkflowTriggersEnabled() {
+    if (process.env.NODE_ENV === 'production') {
+      throw new NotFoundException('Campaign not found');
+    }
+  }
+
   private async seedManagedTemplates() {
     await Promise.all([
       ...DEFAULT_PROMPT_TEMPLATES.map((template) =>
@@ -1357,6 +1993,31 @@ export class CampaignsService implements OnModuleInit {
     ]);
   }
 
+  private async enqueueCampaignGeneration(
+    userId: string,
+    campaignId: string,
+    dto: GenerateCampaignDraftDto,
+    generationAttemptId: string,
+  ) {
+    const data: CampaignGenerationJobData = {
+      userId,
+      campaignId,
+      dto,
+      generationAttemptId,
+    };
+    await this.campaignGenerationQueue.add(CAMPAIGN_GENERATION_JOB, data, {
+      jobId: makeBullJobId(
+        CAMPAIGN_GENERATION_JOB,
+        campaignId,
+        generationAttemptId,
+      ),
+      attempts: CAMPAIGN_GENERATION_ATTEMPTS,
+      backoff: { type: 'exponential', delay: QUEUE_BACKOFF_DELAY_MS },
+      removeOnComplete: QUEUE_REMOVE_ON_COMPLETE,
+      removeOnFail: false,
+    });
+  }
+
   private async scheduleDueOutboxDispatcher() {
     try {
       await this.sequenceQueue.add(
@@ -1372,6 +2033,26 @@ export class CampaignsService implements OnModuleInit {
     } catch (error) {
       this.logger.error(
         'Failed to schedule due outbox dispatcher',
+        error instanceof Error ? error.stack : undefined,
+      );
+    }
+  }
+
+  private async scheduleCampaignGenerationRecoveryDispatcher() {
+    try {
+      await this.campaignGenerationQueue.add(
+        CAMPAIGN_GENERATION_RECOVERY_JOB,
+        {},
+        {
+          jobId: CAMPAIGN_GENERATION_RECOVERY_JOB_ID,
+          repeat: { every: CAMPAIGN_GENERATION_RECOVERY_INTERVAL_MS },
+          removeOnComplete: QUEUE_REMOVE_ON_COMPLETE,
+          removeOnFail: false,
+        },
+      );
+    } catch (error) {
+      this.logger.error(
+        'Failed to schedule campaign generation recovery dispatcher',
         error instanceof Error ? error.stack : undefined,
       );
     }
@@ -1640,6 +2321,67 @@ function toObjectIds(ids: string[], label: string) {
   });
 }
 
+function buildStoredGenerationRequest(
+  dto: GenerateCampaignDraftDto,
+): StoredCampaignGenerationRequest {
+  return {
+    name: dto.name,
+    templateId: dto.templateId,
+    goal: dto.goal,
+    audienceDescription: dto.audienceDescription,
+    tone: dto.tone,
+    maxSteps: dto.maxSteps,
+    groupIds: normalizeIdList(dto.groupIds || []),
+    contactIds: normalizeIdList(dto.contactIds || []),
+  };
+}
+
+function normalizeStoredGenerationRequest(
+  request: any,
+): StoredCampaignGenerationRequest | undefined {
+  if (!request) {
+    return undefined;
+  }
+  const plain = typeof request.toObject === 'function' ? request.toObject() : request;
+  const name = stringOrUndefined(plain.name);
+  const templateId = stringOrUndefined(plain.templateId);
+  const goal = stringOrUndefined(plain.goal);
+  const audienceDescription = stringOrUndefined(plain.audienceDescription);
+  if (!name || !templateId || !goal || !audienceDescription) {
+    return undefined;
+  }
+
+  return {
+    name,
+    templateId,
+    goal,
+    audienceDescription,
+    tone: stringOrUndefined(plain.tone),
+    maxSteps: numberOrUndefined(plain.maxSteps),
+    groupIds: normalizeIdList(
+      Array.isArray(plain.groupIds) ? plain.groupIds.map(String) : [],
+    ),
+    contactIds: normalizeIdList(
+      Array.isArray(plain.contactIds) ? plain.contactIds.map(String) : [],
+    ),
+  };
+}
+
+function storedGenerationRequestToDto(
+  request: StoredCampaignGenerationRequest,
+): GenerateCampaignDraftDto {
+  return {
+    name: request.name,
+    templateId: request.templateId,
+    goal: request.goal,
+    audienceDescription: request.audienceDescription,
+    tone: request.tone,
+    maxSteps: request.maxSteps,
+    groupIds: request.groupIds || [],
+    contactIds: request.contactIds || [],
+  };
+}
+
 function buildCreateCampaignFingerprintInput(
   dto: CreateCampaignDto,
   sequenceSteps: SequenceStep[],
@@ -1683,17 +2425,33 @@ function makeCampaignContacts(contactIds: string[]) {
   }));
 }
 
+function findSequenceStep(steps: SequenceStep[], stepId: string) {
+  const decoded = decodeURIComponent(stepId);
+  return steps.find(
+    (step) => step.stepId === decoded || String(step.order) === decoded,
+  );
+}
+
 function serializeCampaignPlain(campaign: any) {
+  const canRetryGeneration = Boolean(
+    campaign?.status === CampaignStatus.FAILED &&
+      normalizeStoredGenerationRequest(campaign?.generationRequest),
+  );
   const {
     idempotencyScope: _idempotencyScope,
     idempotencyKey: _idempotencyKey,
     idempotencyFingerprint: _idempotencyFingerprint,
+    generationAttemptId: _generationAttemptId,
+    generationLockedAt: _generationLockedAt,
+    generationAttempts: _generationAttempts,
+    generationRequest: _generationRequest,
     ...publicCampaign
   } = campaign || {};
 
   return {
     ...publicCampaign,
     _id: String(publicCampaign._id),
+    canRetryGeneration,
     targetGroupIds: (publicCampaign.targetGroupIds || []).map((id) => String(id)),
     directContactIds: (publicCampaign.directContactIds || []).map((id) =>
       String(id),
@@ -1736,6 +2494,27 @@ function serializeCampaignTemplatePlain(template: any) {
 
 function makeBullJobId(...parts: string[]) {
   return parts.map((part) => part.replace(/[^a-zA-Z0-9_-]/g, '_')).join('__');
+}
+
+function updateMatchedCount(result: any) {
+  if (!result) {
+    return 0;
+  }
+  if (typeof result.matchedCount === 'number') {
+    return result.matchedCount;
+  }
+  if (typeof result.n === 'number') {
+    return result.n;
+  }
+  return 1;
+}
+
+function stringOrUndefined(value: unknown) {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function numberOrUndefined(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {

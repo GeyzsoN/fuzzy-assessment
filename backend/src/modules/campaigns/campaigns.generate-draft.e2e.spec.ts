@@ -15,6 +15,11 @@ describe('campaign draft generation endpoints (e2e)', () => {
     create: jest.fn(),
     listTemplates: jest.fn(),
     generateDraft: jest.fn(),
+    retryGeneration: jest.fn(),
+    debugSimulateGenerationWorkerCrash: jest.fn(),
+    debugRecoverGeneration: jest.fn(),
+    updateSequenceStep: jest.fn(),
+    regenerateSequenceStep: jest.fn(),
   };
 
   const templateResponse = [
@@ -74,6 +79,25 @@ describe('campaign draft generation endpoints (e2e)', () => {
     campaignsService.create.mockResolvedValue(draftResponse);
     campaignsService.listTemplates.mockResolvedValue(templateResponse);
     campaignsService.generateDraft.mockResolvedValue(draftResponse);
+    campaignsService.retryGeneration.mockResolvedValue(draftResponse);
+    campaignsService.debugSimulateGenerationWorkerCrash.mockResolvedValue({
+      ...draftResponse,
+      generationError: 'Debug: simulated worker crash after generation claim',
+    });
+    campaignsService.debugRecoverGeneration.mockResolvedValue({
+      recovery: { scanned: 1, requeued: 1, failed: 0 },
+      campaign: draftResponse,
+    });
+    campaignsService.updateSequenceStep.mockResolvedValue(draftResponse);
+    campaignsService.regenerateSequenceStep.mockResolvedValue({
+      step: {
+        stepId: 'step-1',
+        order: 1,
+        delayMinutes: 0,
+        subjectTemplate: 'Updated note for {{company}}',
+        promptTemplate: 'Hi {{first_name}}, updated note for {{company}}.',
+      },
+    });
 
     const moduleRef = await Test.createTestingModule({
       controllers: [CampaignsController, CampaignTemplatesController],
@@ -219,6 +243,115 @@ describe('campaign draft generation endpoints (e2e)', () => {
       recipients: [],
     });
     expect(res.body.sequenceSteps).toEqual([]);
+  });
+
+  it('requires auth for POST /campaigns/:id/retry-generation', async () => {
+    await request(app.getHttpServer())
+      .post('/campaigns/64c000000000000000000001/retry-generation')
+      .expect(401);
+  });
+
+  it('forwards retry generation requests to the service', async () => {
+    await request(app.getHttpServer())
+      .post('/campaigns/64c000000000000000000001/retry-generation')
+      .set('x-user-id', 'user-1')
+      .expect(201);
+
+    expect(campaignsService.retryGeneration).toHaveBeenCalledWith(
+      'user-1',
+      '64c000000000000000000001',
+    );
+  });
+
+  it('returns 400 when retry generation has no recoverable payload', async () => {
+    campaignsService.retryGeneration.mockRejectedValueOnce(
+      new BadRequestException(
+        'Campaign generation cannot be retried because recovery metadata is missing',
+      ),
+    );
+
+    await request(app.getHttpServer())
+      .post('/campaigns/64c000000000000000000001/retry-generation')
+      .set('x-user-id', 'user-1')
+      .expect(400);
+  });
+
+  it('requires auth for debug worker-crash simulation', async () => {
+    await request(app.getHttpServer())
+      .post(
+        '/campaigns/64c000000000000000000001/debug/simulate-generation-worker-crash',
+      )
+      .expect(401);
+  });
+
+  it('forwards debug worker-crash simulation requests to the service', async () => {
+    await request(app.getHttpServer())
+      .post(
+        '/campaigns/64c000000000000000000001/debug/simulate-generation-worker-crash',
+      )
+      .set('x-user-id', 'user-1')
+      .expect(201);
+
+    expect(
+      campaignsService.debugSimulateGenerationWorkerCrash,
+    ).toHaveBeenCalledWith('user-1', '64c000000000000000000001');
+  });
+
+  it('forwards debug recovery checks to the service', async () => {
+    const res = await request(app.getHttpServer())
+      .post('/campaigns/64c000000000000000000001/debug/recover-generation')
+      .set('x-user-id', 'user-1')
+      .expect(201);
+
+    expect(campaignsService.debugRecoverGeneration).toHaveBeenCalledWith(
+      'user-1',
+      '64c000000000000000000001',
+    );
+    expect(res.body.recovery).toEqual({ scanned: 1, requeued: 1, failed: 0 });
+  });
+
+  it('validates and forwards sequence step edits', async () => {
+    const body = {
+      delayMinutes: 1440,
+      subjectTemplate: 'Updated note for {{company}}',
+      promptTemplate: '<p>Hi {{first_name}}, updated note for {{company}}.</p>',
+    };
+
+    await request(app.getHttpServer())
+      .patch('/campaigns/64c000000000000000000001/sequence-steps/step-1')
+      .set('x-user-id', 'user-1')
+      .send(body)
+      .expect(200);
+
+    expect(campaignsService.updateSequenceStep).toHaveBeenCalledWith(
+      'user-1',
+      '64c000000000000000000001',
+      'step-1',
+      body,
+    );
+  });
+
+  it('validates and forwards one-step regeneration requests', async () => {
+    const body = { instructions: 'Make it more concise.' };
+
+    const res = await request(app.getHttpServer())
+      .post('/campaigns/64c000000000000000000001/sequence-steps/step-1/regenerate')
+      .set('x-user-id', 'user-1')
+      .send(body)
+      .expect(201);
+
+    expect(campaignsService.regenerateSequenceStep).toHaveBeenCalledWith(
+      'user-1',
+      '64c000000000000000000001',
+      'step-1',
+      body,
+    );
+    expect(res.body).toMatchObject({
+      step: {
+        stepId: 'step-1',
+        subjectTemplate: 'Updated note for {{company}}',
+      },
+    });
   });
 
   it('surfaces service validation errors as endpoint errors', async () => {

@@ -2,15 +2,70 @@
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useParams, useRouter } from 'next/navigation';
-import { RefreshCw, Play, Mail, Users, CheckCircle2, AlertCircle, Loader2, ArrowLeft, Sparkles, Check, AlertTriangle, HelpCircle } from 'lucide-react';
+import { RefreshCw, Play, Mail, Users, CheckCircle2, AlertCircle, Loader2, ArrowLeft, Sparkles, Check, AlertTriangle, HelpCircle, Pencil, Save, X } from 'lucide-react';
 import Shell from '@/components/shell';
+import RequireAuth from '@/components/require-auth';
 import { campaignsService, groupsService, Campaign, OutboxRow, ContactGeneration, Contact } from '@/services/api';
+import {
+  TemplateBodyPreview,
+  TemplateRichTextEditor,
+} from '@/components/template-rich-text-editor';
+import { formatCount, pluralize } from '@/lib/format';
 
 function looksLikeGenerationInstruction(value: string) {
   return /^\s*(write|draft|generate|create)\b/i.test(value || '');
 }
 
+function looksLikeHtml(value: string) {
+  return /<[a-z][\s\S]*>/i.test(value || '');
+}
+
+function appendTemplateBody(current: string, addition: string) {
+  const left = current.trim();
+  const right = addition.trim();
+  if (!left) return right;
+  if (!right) return left;
+  if (looksLikeHtml(left) || looksLikeHtml(right)) {
+    return `${left}<p><br></p>${right}`;
+  }
+  return `${left}\n\n${right}`;
+}
+
+type SequenceStepDraft = {
+  delayMinutes: number;
+  subjectTemplate: string;
+  promptTemplate: string;
+};
+
+type RegenerationProposal = {
+  stepId: string;
+  step: Campaign['sequenceSteps'][number];
+};
+
+type DebugGenerationEvent = {
+  id: string;
+  at: string;
+  label: string;
+  details: string;
+};
+
+function formatDebugTimestamp(date = new Date()) {
+  return date.toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
 export default function CampaignDetailPage() {
+  return (
+    <RequireAuth loadingLabel="Checking campaign access...">
+      <CampaignDetailPageContent />
+    </RequireAuth>
+  );
+}
+
+function CampaignDetailPageContent() {
   const router = useRouter();
   const params = useParams();
   const id = params.id as string;
@@ -23,12 +78,42 @@ export default function CampaignDetailPage() {
   const [loading, setLoading] = useState(true);
   const [launching, setLaunching] = useState(false);
   const [sequenceGenerating, setSequenceGenerating] = useState(false);
+  const [retryingGeneration, setRetryingGeneration] = useState(false);
+  const [debuggingGeneration, setDebuggingGeneration] = useState(false);
   const [generatingContactId, setGeneratingContactId] = useState<string | null>(null);
+  const [editingStepId, setEditingStepId] = useState<string | null>(null);
+  const [stepDraft, setStepDraft] = useState<SequenceStepDraft | null>(null);
+  const [savingStepId, setSavingStepId] = useState<string | null>(null);
+  const [regeneratingStepId, setRegeneratingStepId] = useState<string | null>(null);
+  const [regeneratePromptStepId, setRegeneratePromptStepId] = useState<string | null>(null);
+  const [regenerateInstructions, setRegenerateInstructions] = useState('');
+  const [regenerationProposal, setRegenerationProposal] =
+    useState<RegenerationProposal | null>(null);
 
   const [error, setError] = useState<string | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [generationNotice, setGenerationNotice] = useState<string | null>(null);
+  const [debugEvents, setDebugEvents] = useState<DebugGenerationEvent[]>([]);
+  const [debugLastRefreshAt, setDebugLastRefreshAt] = useState<string | null>(null);
   const previousStatusRef = useRef<string | null>(null);
+  const debugCampaignSnapshotRef = useRef<{
+    status: Campaign['status'];
+    stepCount: number;
+  } | null>(null);
+  const regeneratePromptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const debugGenerationTriggersEnabled = process.env.NODE_ENV !== 'production';
+
+  const appendDebugEvent = useCallback((label: string, details: string) => {
+    setDebugEvents((prev) => [
+      {
+        id: `${Date.now()}-${Math.random()}`,
+        at: formatDebugTimestamp(),
+        label,
+        details,
+      },
+      ...prev,
+    ].slice(0, 8));
+  }, []);
 
   // Load Campaign and outbox logs
   const loadCampaignData = useCallback(async (options?: { silent?: boolean }) => {
@@ -40,6 +125,9 @@ export default function CampaignDetailPage() {
     try {
       const camp = await campaignsService.getById(id);
       setCampaign(camp);
+      if (debugGenerationTriggersEnabled) {
+        setDebugLastRefreshAt(formatDebugTimestamp());
+      }
 
       // Load outbox logs if running or completed
       if (
@@ -61,11 +149,25 @@ export default function CampaignDetailPage() {
         setLoading(false);
       }
     }
-  }, [id]);
+  }, [debugGenerationTriggersEnabled, id]);
 
   useEffect(() => {
     loadCampaignData();
   }, [loadCampaignData]);
+
+  useEffect(() => {
+    setDebugEvents([]);
+    setDebugLastRefreshAt(null);
+    debugCampaignSnapshotRef.current = null;
+  }, [id]);
+
+  useEffect(() => {
+    if (!regeneratePromptStepId || regenerationProposal) return;
+
+    requestAnimationFrame(() => {
+      regeneratePromptTextareaRef.current?.focus();
+    });
+  }, [regeneratePromptStepId, regenerationProposal]);
 
   useEffect(() => {
     if (!campaign) return;
@@ -79,6 +181,39 @@ export default function CampaignDetailPage() {
     }
     previousStatusRef.current = campaign.status;
   }, [campaign]);
+
+  useEffect(() => {
+    if (!debugGenerationTriggersEnabled || !campaign) return;
+
+    const next = {
+      status: campaign.status,
+      stepCount: campaign.sequenceSteps.length,
+    };
+    const previous = debugCampaignSnapshotRef.current;
+    debugCampaignSnapshotRef.current = next;
+
+    if (!previous) {
+      appendDebugEvent(
+        'Loaded UI state',
+        `${next.status.toUpperCase()} / ${formatCount(next.stepCount, 'step')}`,
+      );
+      return;
+    }
+
+    if (
+      previous.status !== next.status ||
+      previous.stepCount !== next.stepCount
+    ) {
+      appendDebugEvent(
+        'UI updated from API',
+        `${previous.status.toUpperCase()} / ${formatCount(previous.stepCount, 'step')} -> ${next.status.toUpperCase()} / ${formatCount(next.stepCount, 'step')}`,
+      );
+    }
+  }, [
+    appendDebugEvent,
+    campaign,
+    debugGenerationTriggersEnabled,
+  ]);
 
   useEffect(() => {
     if (!campaign || campaign.status !== 'generating') return;
@@ -144,6 +279,64 @@ export default function CampaignDetailPage() {
     }
   };
 
+  const handleRetryGeneration = async () => {
+    if (!campaign) return;
+    setRetryingGeneration(true);
+    setLaunchError(null);
+    try {
+      const updated = await campaignsService.retryGeneration(campaign.id);
+      setCampaign(updated);
+      setGenerationNotice('Generation retry queued. This page will update when the sequence is ready.');
+    } catch (err: any) {
+      setLaunchError(err.message || 'Failed to retry campaign generation.');
+    } finally {
+      setRetryingGeneration(false);
+    }
+  };
+
+  const handleDebugSimulateWorkerCrash = async () => {
+    if (!campaign) return;
+    setDebuggingGeneration(true);
+    setLaunchError(null);
+    try {
+      const updated =
+        await campaignsService.debugSimulateGenerationWorkerCrash(campaign.id);
+      setCampaign(updated);
+      appendDebugEvent(
+        'Simulated worker crash',
+        `${updated.status.toUpperCase()} / ${formatCount(updated.sequenceSteps.length, 'step')}`,
+      );
+      setGenerationNotice(
+        'Debug worker crash simulated. The stale generation lease is ready for recovery.',
+      );
+    } catch (err: any) {
+      setLaunchError(err.message || 'Failed to simulate worker crash.');
+    } finally {
+      setDebuggingGeneration(false);
+    }
+  };
+
+  const handleDebugRecoverGeneration = async () => {
+    if (!campaign) return;
+    setDebuggingGeneration(true);
+    setLaunchError(null);
+    try {
+      const result = await campaignsService.debugRecoverGeneration(campaign.id);
+      setCampaign(result.campaign);
+      appendDebugEvent(
+        'Ran recovery check',
+        `${result.recovery.requeued} requeued, ${result.recovery.failed} failed. UI received ${result.campaign.status.toUpperCase()} / ${formatCount(result.campaign.sequenceSteps.length, 'step')}.`,
+      );
+      setGenerationNotice(
+        `Debug recovery check complete: ${result.recovery.requeued} requeued, ${result.recovery.failed} failed.`,
+      );
+    } catch (err: any) {
+      setLaunchError(err.message || 'Failed to run recovery check.');
+    } finally {
+      setDebuggingGeneration(false);
+    }
+  };
+
   // Prepare the next queued outbox email from the generated body template.
   const handleGenerate = async (contactId: string) => {
     if (!campaign) return;
@@ -163,6 +356,127 @@ export default function CampaignDetailPage() {
       setLaunchError(err.message || 'Email template preparation failed.');
     } finally {
       setGeneratingContactId(null);
+    }
+  };
+
+  const stepKey = (step: Campaign['sequenceSteps'][number]) =>
+    step.stepId || `step-${step.order}`;
+
+  const beginStepEdit = (step: Campaign['sequenceSteps'][number]) => {
+    setEditingStepId(stepKey(step));
+    setStepDraft({
+      delayMinutes: step.delayMinutes,
+      subjectTemplate: step.subjectTemplate,
+      promptTemplate: step.promptTemplate,
+    });
+    setLaunchError(null);
+  };
+
+  const cancelStepEdit = () => {
+    setEditingStepId(null);
+    setStepDraft(null);
+  };
+
+  const updateStepDraft = (patch: Partial<SequenceStepDraft>) => {
+    setStepDraft((current) => (current ? { ...current, ...patch } : current));
+  };
+
+  const resetRegeneration = () => {
+    setRegeneratePromptStepId(null);
+    setRegenerateInstructions('');
+    setRegenerationProposal(null);
+  };
+
+  const handleSaveStep = async (step: Campaign['sequenceSteps'][number]) => {
+    if (!campaign || !stepDraft) return;
+    const key = stepKey(step);
+    setSavingStepId(key);
+    setLaunchError(null);
+    try {
+      const updated = await campaignsService.updateSequenceStep(campaign.id, key, stepDraft);
+      setCampaign(updated);
+      setGenerationNotice(`Step ${step.order} template updated.`);
+      cancelStepEdit();
+    } catch (err: any) {
+      setLaunchError(err.message || 'Failed to update sequence step.');
+    } finally {
+      setSavingStepId(null);
+    }
+  };
+
+  const beginRegenerateStep = (step: Campaign['sequenceSteps'][number]) => {
+    const key = stepKey(step);
+    if (editingStepId) {
+      cancelStepEdit();
+    }
+    setRegeneratePromptStepId(key);
+    setRegenerateInstructions('');
+    setRegenerationProposal(null);
+    setLaunchError(null);
+  };
+
+  const handleGenerateStepProposal = async (step: Campaign['sequenceSteps'][number]) => {
+    if (!campaign) return;
+    const key = stepKey(step);
+    setRegeneratingStepId(key);
+    setLaunchError(null);
+    try {
+      const proposedStep = await campaignsService.regenerateSequenceStep(
+        campaign.id,
+        key,
+        regenerateInstructions,
+      );
+      setRegenerationProposal({ stepId: key, step: proposedStep });
+      setGenerationNotice(`Step ${step.order} regeneration is ready for review.`);
+    } catch (err: any) {
+      setLaunchError(err.message || 'Failed to regenerate sequence step.');
+    } finally {
+      setRegeneratingStepId(null);
+    }
+  };
+
+  const applyRegenerationProposal = async (
+    step: Campaign['sequenceSteps'][number],
+    mode: 'insert' | 'replace',
+  ) => {
+    if (!campaign || regenerationProposal?.stepId !== stepKey(step)) return;
+    const key = stepKey(step);
+    const proposed = regenerationProposal.step;
+    const nextStep =
+      mode === 'insert'
+        ? {
+            delayMinutes: step.delayMinutes,
+            subjectTemplate: step.subjectTemplate,
+            promptTemplate: appendTemplateBody(
+              step.promptTemplate,
+              proposed.promptTemplate,
+            ),
+          }
+        : {
+            delayMinutes: proposed.delayMinutes,
+            subjectTemplate: proposed.subjectTemplate,
+            promptTemplate: proposed.promptTemplate,
+          };
+
+    setSavingStepId(key);
+    setLaunchError(null);
+    try {
+      const updated = await campaignsService.updateSequenceStep(
+        campaign.id,
+        key,
+        nextStep,
+      );
+      setCampaign(updated);
+      setGenerationNotice(
+        mode === 'insert'
+          ? `Step ${step.order} regeneration inserted below.`
+          : `Step ${step.order} replaced with regenerated copy.`,
+      );
+      resetRegeneration();
+    } catch (err: any) {
+      setLaunchError(err.message || 'Failed to apply regenerated sequence step.');
+    } finally {
+      setSavingStepId(null);
     }
   };
 
@@ -193,6 +507,9 @@ export default function CampaignDetailPage() {
     ? campaign.status === 'draft' ||
       campaign.status === 'generating' ||
       campaign.status === 'failed'
+    : false;
+  const sequenceTemplatesEditable = campaign
+    ? campaign.status === 'draft' || campaign.status === 'failed'
     : false;
 
   const sequenceNeedsGeneration = Boolean(
@@ -345,6 +662,26 @@ export default function CampaignDetailPage() {
             </button>
           )}
 
+          {campaign.status === 'failed' && campaign.canRetryGeneration && (
+            <button
+              onClick={handleRetryGeneration}
+              disabled={retryingGeneration}
+              className="flex-1 md:flex-none inline-flex items-center justify-center px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-300 text-white font-bold text-xs rounded-xl transition-all shadow-md shadow-indigo-100 cursor-pointer active:scale-95"
+            >
+              {retryingGeneration ? (
+                <>
+                  <Loader2 className="animate-spin h-3.5 w-3.5 mr-1.5" />
+                  Retrying...
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
+                  Retry Generation
+                </>
+              )}
+            </button>
+          )}
+
           {/* Launch Action */}
           {campaign.status === 'draft' &&
             campaign.sequenceSteps.length > 0 &&
@@ -392,6 +729,119 @@ export default function CampaignDetailPage() {
         </div>
       )}
 
+      {campaign.status === 'generating' && campaign.generationError && (
+        <div className="mb-8 p-4 bg-amber-50 border border-amber-100 rounded-2xl text-sm text-amber-700 font-medium flex items-center shadow-sm">
+          <RefreshCw className="h-5 w-5 mr-3 shrink-0 text-amber-600" />
+          <span>
+            {campaign.generationError === 'Recovery attempt queued'
+              ? 'Recovery attempt queued. This page will update when the sequence is ready.'
+              : campaign.generationError}
+          </span>
+        </div>
+      )}
+
+      {debugGenerationTriggersEnabled && isPreLaunch && (
+        <div className="mb-8 rounded-2xl border border-dashed border-amber-200 bg-amber-50/60 p-4 shadow-sm">
+          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div>
+              <div className="text-[10px] font-bold uppercase tracking-wider text-amber-700">
+                Debug Generation Recovery
+              </div>
+              <p className="mt-1 text-xs leading-relaxed text-amber-700">
+                Simulate a worker crash after generation is claimed, then run the stale-lease recovery check.
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={handleDebugSimulateWorkerCrash}
+                disabled={debuggingGeneration}
+                className="inline-flex h-9 items-center justify-center rounded-lg border border-amber-200 bg-white px-3 text-xs font-bold text-amber-700 transition-colors hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {debuggingGeneration ? (
+                  <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <AlertTriangle className="mr-1.5 h-3.5 w-3.5" />
+                )}
+                Simulate Worker Crash
+              </button>
+              <button
+                type="button"
+                onClick={handleDebugRecoverGeneration}
+                disabled={debuggingGeneration}
+                className="inline-flex h-9 items-center justify-center rounded-lg bg-amber-600 px-3 text-xs font-bold text-white transition-colors hover:bg-amber-500 disabled:cursor-not-allowed disabled:bg-slate-300"
+              >
+                {debuggingGeneration ? (
+                  <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                )}
+                Run Recovery Check
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-4 border-t border-amber-200/70 pt-4">
+            <div className="grid gap-2 text-xs md:grid-cols-3">
+              <div>
+                <div className="text-[10px] font-bold uppercase tracking-wider text-amber-600">
+                  UI Status
+                </div>
+                <div className="mt-0.5 font-mono font-bold uppercase text-slate-800">
+                  {campaign.status}
+                </div>
+              </div>
+              <div>
+                <div className="text-[10px] font-bold uppercase tracking-wider text-amber-600">
+                  UI Step Count
+                </div>
+                <div className="mt-0.5 font-mono font-bold text-slate-800">
+                  {formatCount(campaign.sequenceSteps.length, 'step')}
+                </div>
+              </div>
+              <div>
+                <div className="text-[10px] font-bold uppercase tracking-wider text-amber-600">
+                  Last API Refresh
+                </div>
+                <div className="mt-0.5 font-mono font-bold text-slate-800">
+                  {debugLastRefreshAt || 'Waiting'}
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-3">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-amber-600">
+                Visible Debug Trace
+              </div>
+              {debugEvents.length === 0 ? (
+                <div className="mt-1 text-xs font-medium text-amber-700">
+                  Click a debug action to record the UI state changes here.
+                </div>
+              ) : (
+                <ol className="mt-2 divide-y divide-amber-200/70 overflow-hidden rounded-lg border border-amber-200/70 bg-white/70">
+                  {debugEvents.map((event) => (
+                    <li
+                      key={event.id}
+                      className="grid gap-1 px-3 py-2 text-xs md:grid-cols-[88px_170px_1fr]"
+                    >
+                      <span className="font-mono text-amber-700">
+                        {event.at}
+                      </span>
+                      <span className="font-bold text-slate-800">
+                        {event.label}
+                      </span>
+                      <span className="font-medium text-slate-600">
+                        {event.details}
+                      </span>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Grid: Overview Summary Status Cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-center">
@@ -402,20 +852,20 @@ export default function CampaignDetailPage() {
         </div>
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-center">
           <span className="block text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1.5">Sequence Steps</span>
-          <span className="text-lg font-sans font-extrabold text-slate-900">{campaign.sequenceSteps.length} Steps</span>
+          <span className="text-lg font-sans font-extrabold text-slate-900">{formatCount(campaign.sequenceSteps.length, 'Step')}</span>
         </div>
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-center">
           <span className="block text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1.5">Audience</span>
           <span className="text-lg font-sans font-extrabold text-slate-900">
             {isPreLaunch
-              ? `${campaign.targetGroupIds.length} Groups / ${audienceContacts.length} Contacts`
-              : `${campaign.recipients.length} Contacts`}
+              ? `${formatCount(campaign.targetGroupIds.length, 'Group')} / ${formatCount(audienceContacts.length, 'Contact')}`
+              : formatCount(campaign.recipients.length, 'Contact')}
           </span>
         </div>
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm text-center">
           <span className="block text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1.5">Total Outbox Rows</span>
           <span className="text-lg font-sans font-extrabold text-slate-900">
-            {isPreLaunch ? '—' : `${outbox.length} Logs`}
+            {isPreLaunch ? '—' : formatCount(outbox.length, 'Log')}
           </span>
         </div>
       </div>
@@ -429,7 +879,7 @@ export default function CampaignDetailPage() {
               Sequence Steps
             </span>
             <span className="text-xs font-semibold text-slate-500">
-              {campaign.sequenceSteps.length} email templates
+              {formatCount(campaign.sequenceSteps.length, 'email template')}
             </span>
           </div>
 
@@ -442,10 +892,19 @@ export default function CampaignDetailPage() {
           ) : (
             <div className="space-y-4">
               {campaign.sequenceSteps.map((step) => {
+                const key = stepKey(step);
                 const pending = looksLikeGenerationInstruction(step.promptTemplate);
+                const editing = editingStepId === key && stepDraft;
+                const saving = savingStepId === key;
+                const regenerating = regeneratingStepId === key;
+                const regeneratePromptOpen = regeneratePromptStepId === key;
+                const proposal =
+                  regenerationProposal?.stepId === key
+                    ? regenerationProposal.step
+                    : null;
                 return (
                   <section
-                    key={step.order}
+                    key={key}
                     className="rounded-xl border border-slate-200 bg-slate-50/40 p-5"
                   >
                     <div className="mb-4 flex flex-col gap-3 border-b border-slate-200 pb-4 md:flex-row md:items-start md:justify-between">
@@ -457,13 +916,109 @@ export default function CampaignDetailPage() {
                           <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
                             Subject
                           </div>
-                          <div className="mt-1 text-sm font-bold text-slate-950">
-                            {step.subjectTemplate}
-                          </div>
+                          {editing ? (
+                            <input
+                              value={stepDraft.subjectTemplate}
+                              onChange={(event) =>
+                                updateStepDraft({ subjectTemplate: event.target.value })
+                              }
+                              className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-bold text-slate-950 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
+                            />
+                          ) : (
+                            <div className="mt-1 text-sm font-bold text-slate-950">
+                              {step.subjectTemplate}
+                            </div>
+                          )}
                         </div>
                       </div>
-                      <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-bold text-slate-600">
-                        Delay: {step.delayMinutes} mins
+                      <div className="flex flex-wrap items-center gap-2">
+                        {editing ? (
+                          <label className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-bold text-slate-600">
+                            Delay
+                            <input
+                              type="number"
+                              min={0}
+                              value={stepDraft.delayMinutes}
+                              onChange={(event) =>
+                                updateStepDraft({
+                                  delayMinutes: Math.max(0, Number(event.target.value || 0)),
+                                })
+                              }
+                              className="w-20 rounded-md border border-slate-200 px-2 py-1 text-right font-mono outline-none focus:border-indigo-500"
+                            />
+                            {pluralize(stepDraft.delayMinutes, 'min')}
+                          </label>
+                        ) : (
+                          <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-bold text-slate-600">
+                            Delay: {formatCount(step.delayMinutes, 'min')}
+                          </div>
+                        )}
+                        <button
+                          type="button"
+                          title={
+                            sequenceTemplatesEditable
+                              ? `Regenerate step ${step.order}`
+                              : 'Sequence templates are locked after launch'
+                          }
+                          onClick={() => beginRegenerateStep(step)}
+                          disabled={
+                            !sequenceTemplatesEditable ||
+                            regenerating ||
+                            Boolean(regeneratingStepId) ||
+                            saving ||
+                            Boolean(editingStepId) ||
+                            Boolean(regeneratePromptStepId && regeneratePromptStepId !== key)
+                          }
+                          className="inline-flex h-9 items-center justify-center rounded-lg border border-indigo-100 bg-indigo-50 px-3 text-xs font-bold text-indigo-700 transition-colors hover:bg-indigo-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
+                        >
+                          {regenerating ? (
+                            <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+                          )}
+                          Regenerate
+                        </button>
+                        {editing ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => handleSaveStep(step)}
+                              disabled={saving}
+                              className="inline-flex h-9 items-center justify-center rounded-lg bg-indigo-600 px-3 text-xs font-bold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-300"
+                            >
+                              {saving ? (
+                                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <Save className="mr-1.5 h-3.5 w-3.5" />
+                              )}
+                              Save
+                            </button>
+                            <button
+                              type="button"
+                              onClick={cancelStepEdit}
+                              disabled={saving}
+                              title="Cancel edit"
+                              className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            title={
+                              sequenceTemplatesEditable
+                                ? `Edit step ${step.order}`
+                                : 'Sequence templates are locked after launch'
+                            }
+                            onClick={() => beginStepEdit(step)}
+                            disabled={!sequenceTemplatesEditable || Boolean(editingStepId)}
+                            className="inline-flex h-9 items-center justify-center rounded-lg border border-slate-200 bg-white px-3 text-xs font-bold text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
+                          >
+                            <Pencil className="mr-1.5 h-3.5 w-3.5" />
+                            Edit
+                          </button>
+                        )}
                       </div>
                     </div>
 
@@ -471,11 +1026,109 @@ export default function CampaignDetailPage() {
                       <div className="mb-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">
                         Email Body
                       </div>
-                      <div className="whitespace-pre-wrap break-words rounded-xl border border-slate-200 bg-white p-4 font-mono text-sm leading-7 text-slate-700">
-                        {pending
-                          ? 'Email body pending generation.'
-                          : step.promptTemplate}
-                      </div>
+                      {editing ? (
+                        <TemplateRichTextEditor
+                          value={stepDraft.promptTemplate}
+                          onChange={(value) => updateStepDraft({ promptTemplate: value })}
+                          disabled={saving}
+                        />
+                      ) : pending ? (
+                        <div className="rounded-xl border border-slate-200 bg-white p-4 text-sm leading-7 text-slate-400">
+                          Email body pending generation.
+                        </div>
+                      ) : (
+                        <TemplateBodyPreview value={step.promptTemplate} />
+                      )}
+
+                      {regeneratePromptOpen && !proposal && (
+                        <div className="mt-4 rounded-xl border border-indigo-100 bg-indigo-50/40 p-4">
+                          <label className="block text-[10px] font-bold uppercase tracking-wider text-indigo-500">
+                            Regeneration Prompt
+                          </label>
+                          <textarea
+                            ref={regeneratePromptTextareaRef}
+                            value={regenerateInstructions}
+                            onChange={(event) =>
+                              setRegenerateInstructions(event.target.value)
+                            }
+                            placeholder="Example: make this shorter, warmer, and more specific to revenue leaders."
+                            className="mt-2 min-h-24 w-full resize-y rounded-xl border border-indigo-100 bg-white px-3 py-2 text-sm leading-6 text-slate-700 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
+                          />
+                          <div className="mt-3 flex flex-wrap justify-end gap-2">
+                            <button
+                              type="button"
+                              onClick={resetRegeneration}
+                              disabled={regenerating}
+                              className="inline-flex h-9 items-center justify-center rounded-lg border border-slate-200 bg-white px-3 text-xs font-bold text-slate-600 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleGenerateStepProposal(step)}
+                              disabled={regenerating}
+                              className="inline-flex h-9 items-center justify-center rounded-lg bg-indigo-600 px-3 text-xs font-bold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-300"
+                            >
+                              {regenerating ? (
+                                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+                              )}
+                              Generate Draft
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      {proposal && (
+                        <div className="mt-4 rounded-xl border border-emerald-100 bg-emerald-50/40 p-4">
+                          <div className="flex flex-col gap-3 border-b border-emerald-100 pb-3 md:flex-row md:items-start md:justify-between">
+                            <div>
+                              <div className="text-[10px] font-bold uppercase tracking-wider text-emerald-600">
+                                Regenerated Subject
+                              </div>
+                              <div className="mt-1 text-sm font-bold text-slate-950">
+                                {proposal.subjectTemplate}
+                              </div>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() => applyRegenerationProposal(step, 'insert')}
+                                disabled={saving}
+                                className="inline-flex h-9 items-center justify-center rounded-lg border border-emerald-200 bg-white px-3 text-xs font-bold text-emerald-700 transition-colors hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-60"
+                              >
+                                Insert Below
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => applyRegenerationProposal(step, 'replace')}
+                                disabled={saving}
+                                className="inline-flex h-9 items-center justify-center rounded-lg bg-indigo-600 px-3 text-xs font-bold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-300"
+                              >
+                                {saving ? (
+                                  <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                                ) : null}
+                                Replace
+                              </button>
+                              <button
+                                type="button"
+                                onClick={resetRegeneration}
+                                disabled={saving}
+                                className="inline-flex h-9 items-center justify-center rounded-lg border border-slate-200 bg-white px-3 text-xs font-bold text-slate-600 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                              >
+                                Discard
+                              </button>
+                            </div>
+                          </div>
+                          <div className="mt-3">
+                            <div className="mb-2 text-[10px] font-bold uppercase tracking-wider text-emerald-600">
+                              Regenerated Body
+                            </div>
+                            <TemplateBodyPreview value={proposal.promptTemplate} />
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </section>
                 );
@@ -496,7 +1149,7 @@ export default function CampaignDetailPage() {
               </p>
             </div>
             <span className="inline-flex items-center px-2.5 py-1 bg-slate-50 text-[10px] text-slate-600 font-bold border border-slate-200 rounded-lg">
-              {audienceContacts.length} contacts
+              {formatCount(audienceContacts.length, 'contact')}
             </span>
           </div>
 
@@ -621,6 +1274,26 @@ export default function CampaignDetailPage() {
                 <p className="max-w-md mx-auto text-xs text-rose-500 leading-relaxed">
                   {campaign.generationError || 'The LLM draft generation job failed.'}
                 </p>
+                {campaign.canRetryGeneration && (
+                  <button
+                    type="button"
+                    onClick={handleRetryGeneration}
+                    disabled={retryingGeneration}
+                    className="inline-flex items-center justify-center px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-300 text-white font-bold text-xs rounded-xl transition-all shadow-md shadow-indigo-100 cursor-pointer active:scale-95"
+                  >
+                    {retryingGeneration ? (
+                      <>
+                        <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+                        Retrying...
+                      </>
+                    ) : (
+                      <>
+                        <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
+                        Retry Generation
+                      </>
+                    )}
+                  </button>
+                )}
               </>
             ) : (
               <>
@@ -759,9 +1432,7 @@ export default function CampaignDetailPage() {
                                     <Check className="h-3.5 w-3.5 mr-1 text-emerald-500" />
                                     {sentRows.length} email{sentRows.length === 1 ? '' : 's'} generated
                                   </div>
-                                  <p className="whitespace-pre-wrap break-words text-[12px] text-slate-600 font-sans leading-6 bg-slate-50 p-3 border border-slate-200/60 rounded-lg">
-                                    &ldquo;{latestSentRow.message}&rdquo;
-                                  </p>
+                                  <TemplateBodyPreview value={latestSentRow.message} />
                                 </div>
                               ) : genState.status === 'completed' ? (
                                 <div className="space-y-1">
@@ -769,9 +1440,7 @@ export default function CampaignDetailPage() {
                                     <Check className="h-3.5 w-3.5 mr-1 text-emerald-500" />
                                     Completed
                                   </div>
-                                  <p className="whitespace-pre-wrap break-words text-[12px] text-slate-600 font-sans leading-6 bg-slate-50 p-3 border border-slate-200/60 rounded-lg">
-                                    &ldquo;{genState.message}&rdquo;
-                                  </p>
+                                  <TemplateBodyPreview value={genState.message} />
                                 </div>
                               ) : genState.status === 'failed' ? (
                                 <div className="space-y-1">
@@ -868,9 +1537,7 @@ export default function CampaignDetailPage() {
                           </td>
                           <td className="px-4 py-3 min-w-[22rem]">
                             {row.status === 'sent' ? (
-                              <p className="whitespace-pre-wrap break-words text-[12px] leading-6 text-slate-600 bg-slate-50/50 p-3 border border-slate-200/60 rounded-xl font-sans">
-                                {row.message}
-                              </p>
+                              <TemplateBodyPreview value={row.message} />
                             ) : row.status === 'failed' ? (
                               <p className="text-[10px] leading-relaxed text-rose-600 bg-rose-50/50 p-2.5 border border-rose-200/60 rounded-xl font-mono">
                                 {row.error || 'Simulated Delivery Failure'}

@@ -37,12 +37,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const saved = window.localStorage.getItem('authUser');
-    if (saved) {
+    const token = window.localStorage.getItem('authToken');
+    if (saved && token) {
       try {
         setUser(JSON.parse(saved));
       } catch {
         window.localStorage.removeItem('authUser');
+        window.localStorage.removeItem('authToken');
       }
+    } else if (saved || token) {
+      window.localStorage.removeItem('authUser');
+      window.localStorage.removeItem('authToken');
     }
     setIsLoading(false);
   }, []);
@@ -84,6 +89,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const logout = () => {
     window.localStorage.removeItem('authToken');
     window.localStorage.removeItem('authUser');
+    window.localStorage.removeItem('adminToken');
     setUser(null);
     router.push('/');
   };

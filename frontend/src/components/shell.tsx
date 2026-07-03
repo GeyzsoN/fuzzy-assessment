@@ -3,18 +3,21 @@
 import React, { useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { useAuth, DEMO_USERS } from '@/hooks/use-auth';
-import { Mail, Users, FolderGit2, Send, LogOut, LogIn, Menu, X, ChevronRight, User } from 'lucide-react';
+import { useAuth } from '@/hooks/use-auth';
+import { Mail, Users, FolderGit2, LogOut, LogIn, Menu, X, User, Loader2, ShieldCheck } from 'lucide-react';
 
 interface ShellProps {
   children: React.ReactNode;
+  authLoadingLabel?: string;
 }
 
-export default function Shell({ children }: ShellProps) {
+export default function Shell({ children, authLoadingLabel = 'Checking session...' }: ShellProps) {
   const pathname = usePathname();
-  const { user, logout } = useAuth();
+  const { user, isLoading, logout } = useAuth();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [userDropdownOpen, setUserDropdownOpen] = useState(false);
+  const isPublicRoute = pathname === '/' || pathname === '/login';
+  const requiresAuth = !isPublicRoute;
 
   const navItems = [
     { name: 'Home', href: '/', icon: Mail },
@@ -203,7 +206,33 @@ export default function Shell({ children }: ShellProps) {
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {children}
+        {requiresAuth && isLoading ? (
+          <div className="flex min-h-[50vh] items-center justify-center text-sm font-semibold text-slate-500">
+            <Loader2 className="mr-2 h-4 w-4 animate-spin text-indigo-600" />
+            {authLoadingLabel}
+          </div>
+        ) : requiresAuth && !user ? (
+          <section className="mx-auto flex min-h-[56vh] max-w-xl flex-col items-center justify-center text-center">
+            <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-xl border border-indigo-100 bg-indigo-50 text-indigo-600">
+              <ShieldCheck className="h-6 w-6" />
+            </div>
+            <h1 className="text-2xl font-bold tracking-tight text-slate-950">
+              Sign in required
+            </h1>
+            <p className="mt-2 max-w-md text-sm leading-6 text-slate-500">
+              Contacts, groups, and campaigns are workspace data. Sign in with a demo profile to continue.
+            </p>
+            <Link
+              href="/login"
+              className="mt-6 inline-flex h-10 items-center justify-center rounded-lg bg-indigo-600 px-4 text-sm font-bold text-white shadow-sm shadow-indigo-100 transition-colors hover:bg-indigo-500"
+            >
+              <LogIn className="mr-2 h-4 w-4" />
+              Sign In / Demo Access
+            </Link>
+          </section>
+        ) : (
+          children
+        )}
       </main>
 
       {/* Clean Footer */}

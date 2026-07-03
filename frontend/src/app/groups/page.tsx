@@ -15,7 +15,9 @@ import {
   ArrowUpDown,
 } from 'lucide-react';
 import Shell from '@/components/shell';
+import RequireAuth from '@/components/require-auth';
 import { groupsService, contactsService, Group, GroupDetail, Contact } from '@/services/api';
+import { formatCount } from '@/lib/format';
 
 type SortDirection = 'asc' | 'desc';
 type GroupSortKey = 'name' | 'memberCount';
@@ -41,9 +43,11 @@ function SortIcon({
 
 export default function GroupsPage() {
   return (
-    <Suspense fallback={<Shell><div className="text-sm text-slate-500">Loading groups...</div></Shell>}>
-      <GroupsPageContent />
-    </Suspense>
+    <RequireAuth loadingLabel="Checking group access...">
+      <Suspense fallback={<Shell><div className="text-sm text-slate-500">Loading groups...</div></Shell>}>
+        <GroupsPageContent />
+      </Suspense>
+    </RequireAuth>
   );
 }
 
@@ -498,7 +502,7 @@ function GroupsPageContent() {
                       </h2>
                       <span className="inline-flex items-center space-x-1 px-2.5 py-1 bg-indigo-50 text-indigo-700 rounded-lg text-[10px] font-bold uppercase tracking-wider border border-indigo-100 shadow-sm">
                         <Users className="h-3 w-3 mr-1" />
-                        {selectedGroupDetail.members.length} members
+                        {formatCount(selectedGroupDetail.members.length, 'member')}
                       </span>
                     </div>
                     {selectedGroupDetail.description ? (

@@ -263,6 +263,69 @@ export function parseCampaignDraftResponse(
   );
 }
 
+export function buildSequenceStepRegenerationPrompt(input: {
+  campaignName: string;
+  campaignPrompt?: string;
+  step: SequenceStep;
+  instructions?: string;
+}): string {
+  return [
+    'Regenerate exactly one outreach sequence email step.',
+    'Return strict JSON only with this shape:',
+    '{"subjectTemplate":"...","promptTemplate":"..."}',
+    'Use only these placeholders when needed: {{name}}, {{first_name}}, {{last_name}}, {{email}}, {{company}}, {{title}}.',
+    'Keep placeholders as placeholders. Do not include real personal data, URLs, phone numbers, or markdown fences.',
+    'The promptTemplate must be actual email body copy, not instructions to write an email.',
+    '',
+    `Campaign name: ${scrubUserText(input.campaignName)}`,
+    `Campaign prompt: ${scrubUserText(input.campaignPrompt || '') || '(none)'}`,
+    `Step order: ${input.step.order}`,
+    `Delay minutes: ${input.step.delayMinutes}`,
+    `Current subjectTemplate: ${scrubUserText(input.step.subjectTemplate)}`,
+    `Current promptTemplate: ${scrubUserText(input.step.promptTemplate)}`,
+    input.instructions
+      ? `Additional revision instructions: ${scrubUserText(input.instructions)}`
+      : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+export function parseSequenceStepRegenerationResponse(
+  raw: string,
+  currentStep: SequenceStep,
+): SequenceStep {
+  const parsed = parseJsonOnly(raw);
+  const candidate = Array.isArray(parsed?.steps) ? parsed.steps[0] : parsed;
+  const subjectTemplate = String(candidate?.subjectTemplate || '').trim();
+  const promptTemplate = String(
+    candidate?.promptTemplate || candidate?.bodyTemplate || candidate?.body || '',
+  ).trim();
+
+  if (containsObviousPii(subjectTemplate) || containsObviousPii(promptTemplate)) {
+    throw new BadRequestException('LLM regenerated step included PII');
+  }
+  if (containsGenerationInstruction(promptTemplate)) {
+    throw new BadRequestException(
+      'LLM regenerated promptTemplate must be actual email copy',
+    );
+  }
+
+  if (!subjectTemplate || !promptTemplate) {
+    throw new BadRequestException(
+      'LLM regenerated step needs subjectTemplate and promptTemplate',
+    );
+  }
+  assertAllowedContactPlaceholders(subjectTemplate, { requirePlaceholder: false });
+  assertAllowedContactPlaceholders(promptTemplate, { requirePlaceholder: true });
+
+  return {
+    ...currentStep,
+    subjectTemplate,
+    promptTemplate,
+  };
+}
+
 export function clampMaxSteps(value?: number): number {
   const numeric = Number(value || 1);
   if (!Number.isFinite(numeric)) {

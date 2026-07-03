@@ -38,13 +38,16 @@ export interface CreateContactBody {
 }
 
 export const contactsApi = {
-  list(params: ListContactsParams = {}): Promise<PaginatedContacts> {
+  list(
+    params: ListContactsParams = {},
+    options: Pick<RequestInit, 'signal'> = {},
+  ): Promise<PaginatedContacts> {
     const qs = new URLSearchParams(
       Object.entries(params)
         .filter(([, v]) => v !== undefined && v !== '')
         .map(([k, v]) => [k, String(v)]),
     ).toString();
-    return request<PaginatedContacts>(`/contacts${qs ? `?${qs}` : ''}`);
+    return request<PaginatedContacts>(`/contacts${qs ? `?${qs}` : ''}`, options);
   },
 
   create(body: CreateContactBody): Promise<Contact> {
